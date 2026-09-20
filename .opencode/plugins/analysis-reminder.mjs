@@ -25,7 +25,14 @@ async function publish(socketPath, state) {
   });
 }
 
-/** 使用当前进程的 SDK transport 读取累计金额，每个 attempt 最多追加一次提醒。 */
+/** 从 SDK 错误提取阶段和原因，供当前 attempt 的状态及日志诊断使用。 */
+function describeError(stage, error) {
+  const reason = error?._tag ?? error?.cause?.code ?? error?.code ?? error?.name ?? "UnknownError";
+  const message = error?.message ?? String(error);
+  return `${stage}:${reason}:${message}`;
+}
+
+/** 使用当前进程的 SDK transport 读取累计金额，每个 attempt 最多提交一次 steer 输入。 */
 export default async function analysisReminder({ client }, options) {
   const { attempt_id, policy, socket_path, session_id } = options ?? {};
   if (!attempt_id || !socket_path || !policy || policy.version !== 1) {
@@ -51,12 +58,16 @@ export default async function analysisReminder({ client }, options) {
     throw error;
   }
 
-  let pending = Promise.resolve();
+  let checking = false;
+  let submissionStarted = false;
   return {
-    "experimental.chat.system.transform": async (input, output) => {
-      // 同一 attempt 的并发钩子串行处理检查和注入，避免重复提醒。
-      pending = pending.then(async () => {
-        if (state.reminder_sent) return;
+    "experimental.chat.system.transform": async (input) => {
+      // prompt admission 可能引起 hook 重入；重入立即返回，不等待当前提交。
+      if (checking || submissionStarted) return;
+      if (state.session_id && input.sessionID !== state.session_id) return;
+      checking = true;
+      let stage = "analysis_reminder_session_read";
+      try {
         try {
           if (!input.sessionID) throw new Error("analysis_reminder_session_missing");
           if (state.session_id && input.sessionID !== state.session_id) return;
@@ -71,13 +82,27 @@ export default async function analysisReminder({ client }, options) {
             throw new Error("analysis_reminder_cost_invalid");
           }
           if (session.cost >= Number(policy.reminder_cost)) {
-            output.system.push(reminder);
+            // 响应丢失时无法确认服务端是否已接收，因此本 attempt 不重复提交。
+            submissionStarted = true;
+            stage = "analysis_reminder_prompt_submit";
+            const admitted = await sdk.v2.session.prompt(
+              { sessionID: session.id, prompt: { text: reminder }, delivery: "steer" },
+              { throwOnError: true },
+            );
             state.reminder_sent = true;
+            console.info(JSON.stringify({
+              event: "analysis_reminder_admitted", attempt_id,
+              session_id: session.id, message_id: admitted.data.data.id,
+              admitted_seq: admitted.data.data.admittedSeq,
+            }));
           }
           state.error = null;
         } catch (error) {
-          state.error = error.message.startsWith("analysis_reminder_")
-            ? error.message : "analysis_reminder_session_read_failed";
+          state.error = describeError(stage, error);
+          console.error(JSON.stringify({
+            event: "analysis_reminder_failed", attempt_id,
+            reason: state.error, submission_started: submissionStarted,
+          }));
         }
         try {
           await publish(socket_path, state);
@@ -85,11 +110,12 @@ export default async function analysisReminder({ client }, options) {
           // 仅记录状态 socket 错误类别；Executor 的金额检查不依赖提醒状态写入。
           console.error(JSON.stringify({
             event: "analysis_reminder_status_write_failed", attempt_id,
-            reason: error.code ?? error.name,
+            reason: describeError("analysis_reminder_status_write", error),
           }));
         }
-      });
-      await pending;
+      } finally {
+        checking = false;
+      }
     },
   };
 }

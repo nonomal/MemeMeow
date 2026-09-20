@@ -8,7 +8,7 @@ Agent 任务只有总超时，无法按模型等级控制一次分析允许消�
 - Server 保留三等级目录并显式启用：`model_free` 提醒 0.05 美元、终止 0.10 美元；`model_standard` 提醒 0.10 美元、终止 0.20 美元；`model_plus` 提醒 0.15 美元、终止 0.30 美元。公开模型选择响应不返回内部金额阈值。
 - 配置工具在未单独指定终止限额时使用提醒限额的两倍；冻结策略保存两个明确值，允许各等级配置不同关系。
 - 任务创建时由可信配置按照模型目录键冻结实际模型、变体、启用状态和金额策略。恢复任务沿用原策略和同一 session 的累计金额。
-- OpenCode 插件读取当前主 session 已完成请求的累计金额，在达到提醒限额后为每个 attempt 最多追加一次中文收尾提示。
+- OpenCode 插件读取当前主 session 已完成请求的累计金额，达到提醒限额后通过 v2 SDK 向当前 session 最多提交一次 `delivery: "steer"` 用户输入；成功接收后记录 admission。
 - Executor 从任务 `OPENCODE_DB` 读取冻结主 session 的 `session.cost`，达到终止限额后复用现有进程组终止和回收流程；允许检查间隔内已完成调用造成金额超过限额。
 - 启用策略的 Agent 不依赖 bubblewrap 或 Linux namespace；Executor 使用任务专属 scratch、数据库、候选 manifest 和 OpenCode 文件权限规则，容器继续提供运行时边界。
 - 因金额达到限额而停止且确认进程已回收时，公开错误为 `agent_maximum_analysis_depth_exceeded`，显示“超过最大分析程度”。受保护诊断保存观测金额、策略阈值、检查阶段、终止信号和回收结果。
