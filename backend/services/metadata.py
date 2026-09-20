@@ -165,6 +165,12 @@ class PostgresMetadataService:
                 record.context_status = "repair_required"
                 raise MetadataError("metadata_invalid") from exc
 
+    @staticmethod
+    def status_from_record(record: Meme) -> dict[str, object]:
+        """从数据库图片记录生成列表语境摘要，供图片库和合集成员列表使用。"""
+        context = MemeContext.model_validate(record.meme_context or {})
+        return {"status": record.context_status, **context.model_dump(include={"title", "summary", "subjects", "meaning", "keywords"})}
+
     def status(self, image: Path, *, identity: dict[str, object] | None = None) -> dict[str, object]:
         """返回图片库安全状态摘要；失效指纹始终显示为 repair_required。"""
         try:

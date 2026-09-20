@@ -460,7 +460,11 @@ class DerivedThumbnailService:
         *,
         source_identities: Mapping[UUID, tuple[int, str]] | None = None,
     ) -> dict[UUID, dict[str, object]]:
-        """按一页 Meme 批量投影并为缺失事实建立 pending 状态。"""
+        """使用数据库中的图片版本生成列表状态，并为缺失记录建立 pending 状态。
+
+        列表复用已保存的 SHA 和大小，文件内容由媒体读取和生成流程检查。
+        ``source_identities`` 保留调用兼容性，列表始终以 Meme 数据库字段为准。
+        """
         result: dict[UUID, dict[str, object]] = {}
         pending_ids: list[UUID] = []
         with self.resources.environment(self.scope) as environment:
@@ -469,20 +473,13 @@ class DerivedThumbnailService:
                 meme
                 for meme in memes
                 if meme.id not in rows
-                and self._source_identity_error(
-                    meme,
-                    source_identities.get(meme.id) if source_identities is not None else None,
-                )
-                is None
             ]
             ensure_many = getattr(environment.thumbnails, "ensure_pending_many", None)
             if missing_memes and callable(ensure_many):
                 rows.update(ensure_many(missing_memes, self.config.profile))
             for meme in memes:
                 row = rows.get(meme.id)
-                source_identity = source_identities.get(meme.id) if source_identities is not None else None
-                source_error = self._source_identity_error(meme, source_identity)
-                if row is None and source_error is None and not callable(ensure_many):
+                if row is None and not callable(ensure_many):
                     try:
                         row = environment.thumbnails.ensure_pending(meme, self.config.profile)
                     except DatabaseError as exc:
@@ -493,14 +490,9 @@ class DerivedThumbnailService:
                             result[meme.id] = {"status": "pending", "media_url": None}
                             continue
                         raise
-                if source_error is not None:
-                    if row is not None:
-                        self._mark_row_stale(row, source_error)
-                elif row is not None and row.status == "available" and not self._output_is_valid(meme, row):
-                    self._mark_row_stale(row, "thumbnail_output_unavailable")
                 projected = self._projection(row, meme_id=meme.id)
                 result[meme.id] = projected
-                if source_error is None and projected["status"] == "pending":
+                if projected["status"] == "pending":
                     pending_ids.append(meme.id)
             environment.uow.session.flush()
         self._enqueue_from_projection_batch(pending_ids)
@@ -755,7 +747,7 @@ class DerivedThumbnailService:
                     continue
                 if row.status in {"failed", "stale"}:
                     continue
-                if row.status == "available" and self._output_is_valid(meme, row):
+                if row.status == "available":
                     continue
                 payloads.append({
                     "meme_id": str(meme.id),

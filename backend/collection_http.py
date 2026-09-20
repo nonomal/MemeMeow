@@ -22,13 +22,15 @@ ThumbnailServiceProvider = Callable[[Request], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 
 
-def collection_payload(request: Request, environment: Any, row: Any, thumbnail_service: ThumbnailServiceProvider | None = None) -> dict[str, object]:
+def collection_payload(request: Request, environment: Any, row: Any, thumbnail_service: ThumbnailServiceProvider | None = None, *, cover: Any = ...) -> dict[str, object]:
     """构造不暴露 scope 的合集摘要。
 
     输入是当前请求、scope-bound 数据环境和合集 ORM 行；输出包含稳定合集 ID、成员数、
     受控封面媒体地址及时间字段。调用场景是列表、创建和重命名成功响应。
+    ``cover`` 可复用调用方已经查询的封面记录，省略时通过当前环境读取。
     """
-    cover = environment.collections.cover(row.id)
+    if cover is ...:
+        cover = environment.collections.cover(row.id)
     payload: dict[str, object] = {
         "collection_id": str(row.id),
         "name": row.name,
@@ -81,12 +83,20 @@ async def list_collections(
         raise error(400, "invalid_request", "合集列表不接受 scope 或 user 参数")
     with environment(request) as database_environment:
         rows = database_environment.collections.list(page=page, page_size=page_size)
-        return {
-            "items": [collection_payload(request, database_environment, row, thumbnail_service) for row in rows],
+        covers = [database_environment.collections.cover(row.id) for row in rows]
+        payload = {
+            "items": [collection_payload(request, database_environment, row, cover=cover) for row, cover in zip(rows, covers)],
             "total": database_environment.collections.count(),
             "page": page,
             "page_size": page_size,
         }
+    if thumbnail_service is not None:
+        projections = thumbnail_service(request).projections([cover for cover in covers if cover is not None])
+        for item, cover in zip(payload["items"], covers):
+            if cover is not None:
+                item["cover_meme_id"] = str(cover.id)
+                item["cover_thumbnail"] = projections[cover.id]
+    return payload
 
 
 async def create_collection(
@@ -121,11 +131,10 @@ async def get_collection(
     error: ErrorFactory,
     thumbnail_service: ThumbnailServiceProvider | None = None,
 ) -> dict[str, object]:
-    """返回合集元数据和当前文件信息的分页成员。
+    """返回数据库保存的合集信息和分页成员。
 
     输入是当前 scope 的合集 ID 与已校验分页参数；输出包含成员当前文件名、稳定 Meme ID、
-    受控媒体地址和 metadata 状态。调用场景是合集详情请求，文件状态由注入的 metadata
-    service 根据 scope-bound storage 解析。
+    受控媒体地址和 metadata 状态。列表使用数据库字段生成状态和文件信息。
     """
     unknown = set(request.query_params) - {"page", "page_size"}
     if unknown:
@@ -136,9 +145,9 @@ async def get_collection(
             if row is None:
                 raise DatabaseError("collection_not_found")
             members: list[dict[str, object]] = []
-            for _item, meme in database_environment.collections.members(row.id, page=page, page_size=page_size):
-                scoped_metadata = metadata_service(request)
-                metadata_status = scoped_metadata.status(scoped_metadata.blob_store.resolve(meme.storage_key))
+            member_records = [meme for _item, meme in database_environment.collections.members(row.id, page=page, page_size=page_size)]
+            for meme in member_records:
+                metadata_status = metadata_service(request).status_from_record(meme)
                 display_name = getattr(meme, "display_name", None)
                 extension = getattr(meme, "extension", None)
                 try:
@@ -159,16 +168,23 @@ async def get_collection(
                         "metadata": metadata_status,
                     }
                 )
-                if thumbnail_service is not None:
-                    thumbnails = thumbnail_service(request)
-                    project = getattr(thumbnails, "projection", None)
-                    members[-1]["thumbnail"] = project(meme) if callable(project) else {"status": "pending", "media_url": None}
-            payload = collection_payload(request, database_environment, row, thumbnail_service)
+            cover = database_environment.collections.cover(row.id)
+            payload = collection_payload(request, database_environment, row, cover=cover)
             payload["members"] = members
             payload["total"] = database_environment.collections.member_count(row.id)
             payload["page"] = page
             payload["page_size"] = page_size
-            return payload
+        if thumbnail_service is not None:
+            projection_records = {meme.id: meme for meme in member_records}
+            if cover is not None:
+                projection_records[cover.id] = cover
+            projections = thumbnail_service(request).projections(list(projection_records.values()))
+            for member, meme in zip(members, member_records):
+                member["thumbnail"] = projections[meme.id]
+            if cover is not None:
+                payload["cover_meme_id"] = str(cover.id)
+                payload["cover_thumbnail"] = projections[cover.id]
+        return payload
     except DatabaseError as exc:
         raise collection_error(exc, error=error) from exc
 

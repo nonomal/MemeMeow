@@ -72,7 +72,7 @@ async def list_images(
         records = database_environment.memes.list(search=search, page=page, page_size=page_size)
         total = database_environment.memes.count(search=search)
     valid_records = records
-    # 列表只使用数据库保存的源版本事实；原图身份校验属于媒体和处理等消费字节的路径。
+    # 图片列表复用数据库保存的 SHA 和大小，缩略图状态查询使用同一份记录。
     source_identities = {record.id: (record.size_bytes, str(record.sha256)) for record in records}
     items: list[dict[str, object]] = []
     identity = visual_identity(request)
