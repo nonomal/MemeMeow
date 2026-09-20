@@ -13,17 +13,17 @@ Executor 在进程检查循环中读取传给 OpenCode 的 `OPENCODE_DB`，使�
 - Python 编译、插件 JavaScript 语法检查、`uv lock --check` 和 OpenSpec 严格校验通过。
 - 开发 Agent 通过 `./scripts/agent-runtime.sh start` 完成构建与启动，镜像固定 OpenCode `1.18.18`，共享依赖沿用镜像安装。
 
-## 真实任务环境阻塞
+## 真实任务环境
 
-通过开发容器现有 Executor HTTP 接口提交带测试标识的图片任务。attempt 为 `session-cost-termination-14e20f3ee0424667b8bae6f14ecf78a0`，最终 `failed`，`process_reaped=true`，未产生主 session，观测金额为 0。
+此前的真实 attempt 因容器内 bubblewrap 无法创建 Linux namespace 而退出，OpenCode 未能启动。当前实现已取消图片分析对 bubblewrap、PID namespace 及其他 Linux namespace 的依赖，Executor 直接启动已经完成任务目录和权限校验的 OpenCode 命令。
 
-容器内 bubblewrap 返回 `No permissions to create new namespace`，OpenCode 未能启动。Executor 对外记录 `agent_analysis_usage_unavailable:session_binding_deadline_exceeded`。真实金额终止和提醒尚未通过验收；服务构建成功和单元测试通过均不能替代这些验收。
+需要重新提交带测试标识的图片任务，验证插件就绪、主 session 用量读取、提醒次数、终止回收和任务结果写入。服务构建成功和单元测试通过不能替代这次真实任务验收。
 
 ## 独立审查与处理
 
 default 子代理审查了当前改动、任务数据库权限、调用路径和测试范围。
 
 - 数据库信任边界：Agent 可以写入自身任务数据库。金额单调检查可以拒绝已观测到的金额减少，无法识别所有合法形式的数据库改写。本功能按照既定设计提供正常执行中的分析程度控制，保留这一限制；本次不增加数据库写入代理或操作系统身份隔离改造。
-- 验证覆盖：已补充 WAL 并发写入及排他锁测试。完整 Executor 真实执行受上述 namespace 权限阻塞，保留为发布前待完成项目。
+- 验证覆盖：已补充 WAL 并发写入及排他锁测试。图片分析已移除 namespace 启动依赖，真实模型任务仍需在更新后的 Agent 容器中重新验收。
 
 公共提交待用户审核；Server 同步和真实验收在授权后继续。

@@ -4,7 +4,7 @@
 
 ### Requirement: Agent 容器必须具有明确的宿主机访问边界
 
-系统 MUST 仅向 Agent 容器提供所需的目录挂载：当前任务 scratch、结果目录和任务专属 OpenCode 数据库可写，当前输入图片、项目 Skill、分析程度提醒插件源码、插件运行时依赖及可选候选目录只读。启用分析策略时 MUST 强制经过 bubblewrap，并使用独立 PID namespace 和 procfs；Executor token、其他任务 runtime、其他 workspace、其他图片及宿主进程信息 MUST 不可见。提醒插件和依赖 MUST 从与任务可写配置目录分离的受保护位置加载；任务中的 Bash、Python 或 Node 不能修改它们，也不能通过修改共享配置让后续任务加载不同的插件代码。插件可以通过当前 OpenCode 进程提供的受控接口读取本任务 session 的累计用量。容器 MUST 不获得项目根目录、用户目录、业务数据库凭据或 Docker socket 的访问能力。
+系统 MUST 仅向 Agent 容器提供所需的目录挂载：当前任务 scratch、结果目录和任务专属 OpenCode 数据库可写，当前输入图片、项目 Skill、分析程度提醒插件源码、插件运行时依赖及可选候选目录只读。启用分析策略时 MUST 使用任务专属目录、服务端候选 manifest 校验和 OpenCode 文件权限规则，MUST NOT 依赖 bubblewrap、PID namespace 或其他 Linux namespace。提醒插件和依赖 MUST 从与任务可写配置目录分离的受保护位置加载；任务中的 Bash、Python 或 Node 不能修改它们，也不能通过修改共享配置让后续任务加载不同的插件代码。插件可以通过当前 OpenCode 进程提供的受控接口读取本任务 session 的累计用量。容器 MUST 不获得项目根目录、用户目录、业务数据库凭据或 Docker socket 的访问能力。
 
 #### Scenario: Agent 读取输入图片和受保护插件
 - **WHEN** Agent 执行图片研究并加载分析程度提醒插件
@@ -28,4 +28,4 @@
 
 #### Scenario: 启用策略的 Agent 尝试读取 Executor 或其他任务
 - **WHEN** Agent 读取 Executor token、宿主进程环境、其他任务目录或其他图片
-- **THEN** bubblewrap 挂载和 PID namespace 拒绝访问，同时当前任务输入、Skill、scratch 和结果目录保持可用
+- **THEN** 常规文件工具按照 `permission.external_directory` 拒绝越界访问，当前任务输入、Skill、scratch 和结果目录保持可用，Executor 不创建 Linux namespace

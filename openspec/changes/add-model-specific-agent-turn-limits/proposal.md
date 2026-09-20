@@ -10,7 +10,7 @@ Agent 任务只有总超时，无法按模型等级控制一次分析允许消�
 - 任务创建时由可信配置按照模型目录键冻结实际模型、变体、启用状态和金额策略。恢复任务沿用原策略和同一 session 的累计金额。
 - OpenCode 插件读取当前主 session 已完成请求的累计金额，在达到提醒限额后为每个 attempt 最多追加一次中文收尾提示。
 - Executor 从任务 `OPENCODE_DB` 读取冻结主 session 的 `session.cost`，达到终止限额后复用现有进程组终止和回收流程；允许检查间隔内已完成调用造成金额超过限额。
-- 启用策略的 Agent 强制经过 bubblewrap，只能访问当前任务的 scratch、结果、输入图片、Skill、插件和可选候选目录；Executor token、宿主进程信息及其他任务目录均不可见。
+- 启用策略的 Agent 不依赖 bubblewrap 或 Linux namespace；Executor 使用任务专属 scratch、数据库、候选 manifest 和 OpenCode 文件权限规则，容器继续提供运行时边界。
 - 因金额达到限额而停止且确认进程已回收时，公开错误为 `agent_maximum_analysis_depth_exceeded`，显示“超过最大分析程度”。受保护诊断保存观测金额、策略阈值、检查阶段、终止信号和回收结果。
 - 现有 Agent 轮次和活动时间继续作为可选观察信息，不参与提醒、金额计算或终止判断。
 

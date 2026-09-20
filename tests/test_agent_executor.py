@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import json
-import socket
 import stat
-import subprocess
-import tempfile
 import threading
 import time
 import urllib.error
@@ -25,15 +22,6 @@ from backend.opencode import OpenCodeError, OpenCodeRunner
 from backend.opencode_workspace import WorkspaceCapabilitySigner
 from executor import server as executor_server
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
-
-
-@pytest.fixture
-def analysis_executor_root() -> Iterator[Path]:
-    """在仓库测试缓存目录创建一次性分析隔离根目录。"""
-    root = Path(".pytest_cache/analysis_agent_executor")
-    root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=root) as directory:
-        yield Path(directory)
 
 
 def _candidate() -> dict[str, object]:
@@ -216,185 +204,35 @@ def test_executor_runs_fixed_task_and_returns_result(executor_fixture) -> None:
     assert error.value.code == "agent_image_path_forbidden"
 
 
-def test_candidate_sandbox_creates_hidden_runtime_mountpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """隐藏 runtime 后，当前任务的 workspace、结果和候选目录仍有明确挂载目标。"""
-    runtime = tmp_path / "runtime"
-    workspace = runtime / "workspace"
-    scratch = workspace / "tasks" / "task-sandbox"
-    result = runtime / "task-results" / "task-sandbox"
-    candidate = runtime / "candidates" / "task-sandbox"
-    for path in (workspace, scratch / "home", result, candidate):
-        path.mkdir(parents=True)
-    task = executor_server.TaskState(
-        task_id="attempt-sandbox",
-        business_task_id="task-sandbox",
-        executor_attempt_id="attempt-sandbox",
-        image_relative_path="sample.png",
-        reverse_image_policy="forbid",
-        timeout_seconds=5,
-        workspace_directory=workspace,
-        candidate_root=candidate,
-        visual_snapshot_sha256="a" * 64,
-        task_scratch_root=scratch,
-    )
-    monkeypatch.setattr(executor_server, "RUNTIME_ROOT", runtime)
-    monkeypatch.setattr(executor_server, "WORKSPACE", workspace)
-    monkeypatch.setattr(executor_server, "RESULT_ROOT", runtime / "task-results")
-    monkeypatch.setattr(executor_server.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
-
-    sandboxed = executor_server.Executor._sandbox_command(SimpleNamespace(token_file=""), task, ["/bin/true"])
-
-    assert sandboxed[0] == "/usr/bin/bwrap"
-    assert "--tmpfs" in sandboxed
-    for path in (runtime / "workspace", runtime / "workspace" / "tasks", scratch, scratch / "home", runtime / "task-results", result, runtime / "candidates", candidate):
-        assert "--dir" in sandboxed
-        assert str(path) in sandboxed
-    candidate_bind = next(
-        index
-        for index in range(len(sandboxed) - 2)
-        if sandboxed[index : index + 3] == ["--ro-bind", str(candidate), str(candidate)]
-    )
-    assert candidate_bind < sandboxed.index("--", candidate_bind)
-
-
-def test_analysis_policy_uses_private_database_and_sandbox_view(analysis_executor_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """分析策略任务只挂载当前任务资源，并隐藏 Executor token 与宿主进程信息。"""
-    runtime = analysis_executor_root / "runtime"
-    workspace = runtime / "workspace"
-    scratch = workspace / "tasks" / "task-analysis"
-    result = runtime / "task-results" / "task-analysis"
-    images = analysis_executor_root / "images"
-    skills = analysis_executor_root / "skills"
-    secret = analysis_executor_root / "executor-secret"
-    for path in (scratch / "home", result, images, skills, secret):
-        path.mkdir(parents=True)
-    image = images / "sample.png"
-    image.write_bytes(b"image")
-    token = secret / "token"
-    token.write_text("executor-secret", encoding="ascii")
-    policy = {
-        "version": 1,
-        "model_key": "model_plus",
-        "model": "mememeow/gpt-5.6-luna",
-        "variant": "max",
-        "currency": "USD",
-        "reminder_cost": "0.15",
-        "termination_cost": "0.30",
-    }
+@pytest.mark.parametrize(
+    ("visual_snapshot_sha256", "analysis_policy"),
+    (
+        (None, None),
+        ("a" * 64, None),
+        (None, {"version": 1, "termination_cost": "0.30"}),
+        ("a" * 64, {"version": 1, "termination_cost": "0.30"}),
+    ),
+)
+def test_image_analysis_does_not_require_linux_namespace(
+    tmp_path: Path,
+    visual_snapshot_sha256: str | None,
+    analysis_policy: dict[str, object] | None,
+) -> None:
+    """图片分析命令即使带候选快照或用量策略，也不调用 namespace 隔离。"""
     task = executor_server.TaskState(
         task_id="task-analysis",
         business_task_id="task-analysis",
-        executor_attempt_id="a",
+        executor_attempt_id="attempt-analysis",
         image_relative_path="sample.png",
         reverse_image_policy="forbid",
         timeout_seconds=5,
-        workspace_directory=workspace,
-        images_root=images,
-        skill_root=skills,
-        task_scratch_root=scratch,
-        analysis_policy=policy,
+        task_scratch_root=tmp_path / "scratch",
+        visual_snapshot_sha256=visual_snapshot_sha256,
+        analysis_policy=analysis_policy,
     )
-    monkeypatch.setattr(executor_server, "RUNTIME_ROOT", runtime)
-    monkeypatch.setattr(executor_server, "WORKSPACE", workspace)
-    monkeypatch.setattr(executor_server, "RESULT_ROOT", runtime / "task-results")
-    socket_root = runtime / "s"
-    monkeypatch.setattr(executor_server, "ANALYSIS_SOCKET_ROOT", socket_root)
-    socket_root.mkdir(parents=True)
-    socket_path = socket_root / "a.sock"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path))
-    listener.listen(1)
-    listener.close()
-    monkeypatch.setattr(executor_server.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
-    executor = SimpleNamespace(token_file=str(token))
+    command = ["/bin/true"]
 
-    sandboxed = executor_server.Executor._sandbox_command(executor, task, ["/bin/true"])
-    environment = executor_server.Executor._task_environment(
-        SimpleNamespace(model_broker_url="https://broker.example/v1", legacy_base_url="", legacy_api_key=""),
-        task,
-    )
-
-    assert sandboxed[:5] == ["/usr/bin/bwrap", "--die-with-parent", "--unshare-pid", "--ro-bind", "/"]
-    assert ["--proc", "/proc"] == sandboxed[sandboxed.index("--proc") : sandboxed.index("--proc") + 2]
-    assert ["--tmpfs", str(runtime)] in [sandboxed[index:index + 2] for index in range(len(sandboxed) - 1)]
-    assert ["--tmpfs", str(images)] in [sandboxed[index:index + 2] for index in range(len(sandboxed) - 1)]
-    assert ["--bind", str(workspace), str(workspace)] not in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
-    assert ["--bind", str(runtime / "opencode.db"), str(runtime / "opencode.db")] not in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
-    assert ["--bind", str(scratch), str(scratch)] in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
-    assert ["--ro-bind", str(image), str(image)] in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
-    assert ["--ro-bind", "/dev/null", str(token)] in [sandboxed[index:index + 3] for index in range(len(sandboxed) - 2)]
-    assert environment["OPENCODE_DB"] == str(scratch / "opencode.db")
-    assert executor_server.Executor._process_directory(task) == scratch
-
-
-def test_analysis_policy_bubblewrap_hides_other_task_files(analysis_executor_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """真实 bubblewrap 进程只能访问当前任务挂载和空的 Executor token 文件。"""
-    if executor_server.shutil.which("bwrap") is None:
-        pytest.skip("bubblewrap unavailable")
-    runtime = analysis_executor_root / "runtime"
-    workspace = runtime / "workspace"
-    scratch = workspace / "tasks" / "task-analysis"
-    other_task = workspace / "tasks" / "other-task"
-    result = runtime / "task-results" / "task-analysis"
-    images = analysis_executor_root / "images"
-    skills = analysis_executor_root / "skills"
-    secret = analysis_executor_root / "executor-secret"
-    for path in (scratch / "home", other_task, result, images, skills, secret):
-        path.mkdir(parents=True)
-    image = images / "sample.png"
-    other_image = images / "other.png"
-    image.write_bytes(b"image")
-    other_image.write_bytes(b"other")
-    (other_task / "secret.txt").write_text("other task", encoding="utf-8")
-    (skills / "SKILL.md").write_text("skill", encoding="utf-8")
-    token = secret / "token"
-    token.write_text("executor-secret", encoding="ascii")
-    task = executor_server.TaskState(
-        task_id="task-analysis",
-        business_task_id="task-analysis",
-        executor_attempt_id="a",
-        image_relative_path="sample.png",
-        reverse_image_policy="forbid",
-        timeout_seconds=5,
-        workspace_directory=workspace,
-        images_root=images,
-        skill_root=skills,
-        task_scratch_root=scratch,
-        analysis_policy={"version": 1, "termination_cost": "0.30"},
-    )
-    monkeypatch.setattr(executor_server, "RUNTIME_ROOT", runtime)
-    monkeypatch.setattr(executor_server, "WORKSPACE", workspace)
-    monkeypatch.setattr(executor_server, "RESULT_ROOT", runtime / "task-results")
-    socket_root = runtime / "s"
-    monkeypatch.setattr(executor_server, "ANALYSIS_SOCKET_ROOT", socket_root)
-    socket_root.mkdir(parents=True)
-    socket_path = socket_root / "a.sock"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path))
-    listener.listen(1)
-    listener.close()
-    checks = " && ".join((
-        'test ! -s "$1"',
-        'test -r "$2"',
-        'test ! -e "$3"',
-        'test ! -e "$4"',
-        'test -r "$5"',
-        'cat /proc/1/cmdline > "$6/proc-one"',
-        'touch "$6/scratch-write"',
-        'touch "$7/result-write"',
-    ))
-    command = [
-        "/bin/sh", "-c", checks, "sandbox-check", str(token), str(image), str(other_image),
-        str(other_task / "secret.txt"), str(skills / "SKILL.md"), str(scratch), str(result),
-    ]
-    sandboxed = executor_server.Executor._sandbox_command(SimpleNamespace(token_file=str(token)), task, command)
-
-    completed = subprocess.run(sandboxed, cwd=scratch, check=False, capture_output=True, text=True)
-
-    assert completed.returncode == 0, completed.stderr
-    assert (scratch / "scratch-write").is_file()
-    assert (result / "result-write").is_file()
-    assert (scratch / "proc-one").read_bytes().startswith(b"/usr/bin/bwrap\x00")
+    assert executor_server.Executor._sandbox_command(SimpleNamespace(token_file=""), task, command) == command
 
 
 def test_executor_preserves_result_validation_reason_code(executor_fixture, monkeypatch: pytest.MonkeyPatch) -> None:

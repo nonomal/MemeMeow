@@ -20,7 +20,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import shutil
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -166,7 +165,6 @@ _EXECUTOR_ERROR_CODES = frozenset(
         "agent_provider_rate_limited",
         "agent_provider_server_error",
         "agent_connection_interrupted",
-        "agent_candidate_isolation_unavailable",
         "session_binding_mismatch",
         "session_not_resumable",
         "opencode_workspace_invalid",
@@ -1285,92 +1283,14 @@ class Executor:
         return task.workspace_directory or WORKSPACE
 
     def _sandbox_command(self, task: TaskState, command: list[str]) -> list[str]:
-        """为候选清单或分析策略任务建立只看当前任务目录的进程边界。
+        """返回已经完成路径校验的 OpenCode 命令，不创建 Linux namespace。
 
-        输入是已经通过任务校验的命令和状态；输出是交给 subprocess 的命令列表。
-        候选清单和分析控制都涉及任务间隔离，必须在操作系统挂载视图中隐藏其他任务
-        目录、Executor token 和宿主进程信息，不能只依赖环境变量或 OpenCode 提示词。
+        图片分析任务继续使用独立 scratch、任务数据库、候选 manifest 和 OpenCode
+        文件权限规则；容器边界由 Compose 提供。保留该方法作为统一执行入口，避免
+        调用方重新组装已经校验的命令。
         """
-        if not task.visual_snapshot_sha256 and task.analysis_policy is None:
-            return command
-        candidate_root = task.candidate_root or (RUNTIME_ROOT / "candidates" / task.business_task_id)
-        if task.visual_snapshot_sha256 and not candidate_root.is_dir():
-            raise RuntimeError("visual_candidate_materialization_failed")
-        bubblewrap = shutil.which("bwrap")
-        if not bubblewrap:
-            code = "agent_runtime_unavailable" if task.analysis_policy is not None else "agent_candidate_isolation_unavailable"
-            raise RuntimeError(code)
-        # 先隐藏整个 runtime，再只挂回当前任务需要的目录和文件。这样 Agent 即使
-        # 改写 manifest 环境变量，也看不到其他任务或 scope 的候选目录。
-        mounts: list[str] = [
-            bubblewrap,
-            "--die-with-parent",
-            "--unshare-pid",
-            "--ro-bind", "/", "/",
-            "--proc", "/proc",
-            "--tmpfs", str(RUNTIME_ROOT),
-        ]
-        scratch = task.task_scratch_root or (WORKSPACE / "tasks" / task.business_task_id)
-        workspace = task.workspace_directory or WORKSPACE
-        image_root = task.images_root or IMAGE_ROOT
-        skill_root = task.skill_root or SKILL_ROOT
-        hidden_roots = [Path(os.path.abspath(RUNTIME_ROOT))]
-
-        def hidden_by_existing(path: Path) -> bool:
-            """判断路径是否已经位于先前隐藏的目录中。"""
-            absolute = Path(os.path.abspath(path))
-            return any(absolute == root or absolute.is_relative_to(root) for root in hidden_roots)
-
-        for root in (image_root, workspace if task.analysis_policy is not None else None):
-            if root is not None and not hidden_by_existing(root):
-                absolute = Path(os.path.abspath(root))
-                mounts.extend(("--tmpfs", str(absolute)))
-                hidden_roots.append(absolute)
-
-        writable_directories = [scratch, scratch / "home", RESULT_ROOT / task.business_task_id]
-        if task.analysis_policy is None:
-            writable_directories.insert(0, workspace)
-        # tmpfs 会遮住 runtime 原有目录；先逐级创建目标，再单独挂回可写视图，
-        # 确保 OpenCode 的配置、缓存、结果文件仍能写入，同时候选目录保持只读。
-        created: set[Path] = set()
-
-        def add_mountpoint(path: Path) -> None:
-            """为隐藏目录中的目标补齐 tmpfs 挂载点。"""
-            absolute = Path(os.path.abspath(path))
-            hidden_root = next((root for root in hidden_roots if absolute == root or absolute.is_relative_to(root)), None)
-            if hidden_root is None:
-                return
-            relative = absolute.relative_to(hidden_root)
-            current = hidden_root
-            for part in relative.parts:
-                current /= part
-                if current not in created:
-                    mounts.extend(("--dir", str(current)))
-                    created.add(current)
-
-        for directory in writable_directories:
-            add_mountpoint(directory)
-            mounts.extend(("--bind", str(directory), str(directory)))
-        if task.analysis_policy is None:
-            database_path = RUNTIME_ROOT / "opencode.db"
-            mounts.extend(("--bind", str(database_path), str(database_path)))
-        add_mountpoint(skill_root)
-        mounts.extend(("--ro-bind", str(skill_root), str(skill_root)))
-        if task.visual_snapshot_sha256:
-            add_mountpoint(candidate_root)
-            mounts.extend(("--ro-bind", str(candidate_root), str(candidate_root)))
-        if task.analysis_policy is not None:
-            socket_path = ANALYSIS_SOCKET_ROOT / f"{task.executor_attempt_id}.sock"
-            add_mountpoint(socket_path.parent)
-            mounts.extend(("--ro-bind", str(socket_path), str(socket_path)))
-        image = image_root / _relative_image_path(task.image_relative_path)
-        add_mountpoint(image.parent)
-        mounts.extend(("--ro-bind", str(image), str(image)))
-        token_path = Path(self.token_file) if self.token_file else None
-        if token_path is not None and not hidden_by_existing(token_path):
-            mounts.extend(("--ro-bind", "/dev/null", str(token_path)))
-        mounts.extend(("--", *command))
-        return mounts
+        del task
+        return command
 
     def _prompt(self, task: TaskState) -> str:
         """生成唯一业务 prompt；调用方不能覆盖路径、命令或提示词。"""
@@ -1908,7 +1828,6 @@ class Handler(BaseHTTPRequestHandler):
                 "agent_analysis_policy_invalid",
                 "visual_match_snapshot_invalid",
                 "visual_candidate_materialization_failed",
-                "agent_candidate_isolation_unavailable",
             }:
                 code = "agent_runtime_unavailable"
             status = {

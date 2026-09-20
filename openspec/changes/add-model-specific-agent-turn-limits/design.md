@@ -62,11 +62,11 @@ SQLite 连接以只读模式打开。数据库缺失、schema 不兼容、sessio
 
 OpenCode 在请求完成后更新累计金额，检查也存在固定间隔。因此一次或多个已经完成的调用可能让最终金额超过终止限额。该限额表示分析程度边界，不承担财务结算。
 
-### 5. 启用策略时强制任务级系统隔离
+### 5. 启用策略时使用任务目录和文件权限边界
 
-启用策略的任务必须经过 bubblewrap。挂载视图先隐藏 runtime、workspace 和图片根目录，再挂入当前任务 scratch、结果目录、输入图片、Skill、插件及可选候选目录。任务使用独立 `OPENCODE_DB`，OpenCode 的 `--dir` 和进程工作目录均指向当前 scratch。
+启用策略的任务不再调用 bubblewrap，也不创建 PID 或其他 Linux namespace。Executor 继续使用任务专属 `OPENCODE_DB`、scratch、输入图片和结果目录；候选 manifest 经过服务端校验后写入当前任务候选目录。OpenCode 的 `--dir`、进程工作目录和 `permission.external_directory` 继续限制常规文件工具的访问范围。
 
-bubblewrap 使用独立 PID namespace 和 procfs，并以空文件遮蔽 Executor token。Agent 不能读取宿主 Executor 环境、其他任务目录或其他图片。模型 capability 仍进入当前 OpenCode 环境，用于调用 broker；Server 必须把该 capability 绑定当前 attempt、模型及有效期。
+Agent 容器继续使用非 root、只读根文件系统、受控挂载和无长期凭据配置。模型 capability 仍进入当前 OpenCode 环境，用于调用 broker；Server 必须把该 capability 绑定当前 attempt、模型及有效期。Shell、Python 和 Node 的访问范围由现有容器挂载和服务端文件权限共同承担，不新增 namespace 依赖。
 
 ### 6. 插件就绪门禁绑定当前 attempt
 
