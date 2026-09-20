@@ -1404,7 +1404,9 @@ class Executor:
                         attempt_id=task.executor_attempt_id, policy=task.analysis_policy,
                         database=Path(env["OPENCODE_DB"]), directory=process_directory,
                         status_path=scratch / f"analysis-{task.executor_attempt_id}.json",
-                        startup_deadline=min(deadline, time.monotonic() + 30),
+                        # 主 session 可能在 OpenCode 完成冷启动和首个模型请求后才出现。
+                        # 使用任务自身的总期限等待绑定，避免把合法的慢启动误判为用量不可用。
+                        startup_deadline=deadline,
                         status_socket=analysis_socket,
                         observed_cost=Decimal(task.observed_cost or "0"),
                     )
