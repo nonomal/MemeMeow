@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from starlette.concurrency import run_in_threadpool
 
 
 class _SearchRequestModel(BaseModel):
@@ -32,6 +33,31 @@ ThumbnailProjectionProvider = Callable[[Request, str], dict[str, object] | None]
 
 
 async def search_images(
+    request: Request,
+    payload: SearchRequest,
+    *,
+    service: Callable[[Request, str], Any],
+    media_for_meme: Callable[[Request, str], str | None],
+    error: Callable[[int, str, str], HTTPException],
+    thumbnail_for_meme: ThumbnailProjectionProvider | None = None,
+) -> dict[str, object]:
+    """将已解析的搜索请求交给 Starlette 线程池，返回媒体结果或传播 HTTP 错误。
+
+    `/search` 的缓存检查、模型请求和结果读取在同一个工作线程内执行，数据库
+    Session 由同步业务创建和关闭，事件循环可以继续处理其他请求。
+    """
+    return await run_in_threadpool(
+        _search_images_sync,
+        request,
+        payload,
+        service=service,
+        media_for_meme=media_for_meme,
+        error=error,
+        thumbnail_for_meme=thumbnail_for_meme,
+    )
+
+
+def _search_images_sync(
     request: Request,
     payload: SearchRequest,
     *,
