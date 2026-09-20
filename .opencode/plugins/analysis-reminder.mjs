@@ -27,9 +27,10 @@ async function publish(socketPath, state) {
 
 /** 从 SDK 错误提取阶段和原因，供当前 attempt 的状态及日志诊断使用。 */
 function describeError(stage, error) {
-  const reason = error?._tag ?? error?.cause?.code ?? error?.code ?? error?.name ?? "UnknownError";
+  const reason = error?.cause?.body?._tag ?? error?._tag ?? error?.cause?.code ?? error?.code ?? error?.name ?? "UnknownError";
   const message = error?.message ?? String(error);
-  return `${stage}:${reason}:${message}`;
+  const status = error?.cause?.status;
+  return `${stage}:${status ? `HTTP_${status}:` : ""}${reason}:${message}`;
 }
 
 /** 使用当前进程的 SDK transport 读取累计金额，每个 attempt 最多提交一次 steer 输入。 */
@@ -54,6 +55,8 @@ export default async function analysisReminder({ client }, options) {
   } catch (error) {
     state.error = error.message === "analysis_plugin_runtime_version_incompatible"
       ? error.message : "analysis_plugin_initialization_failed";
+    state.error_detail = describeError("analysis_plugin_initialize", error);
+    console.error(JSON.stringify({ event: state.error, attempt_id, reason: state.error_detail }));
     await publish(socket_path, state);
     throw error;
   }
@@ -70,7 +73,6 @@ export default async function analysisReminder({ client }, options) {
       try {
         try {
           if (!input.sessionID) throw new Error("analysis_reminder_session_missing");
-          if (state.session_id && input.sessionID !== state.session_id) return;
           const response = await sdk.v2.session.get(
             { sessionID: input.sessionID }, { throwOnError: true },
           );
