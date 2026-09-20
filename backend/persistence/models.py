@@ -682,7 +682,8 @@ class ImageProcessingAttempt(Base):
     termination_signal: Mapped[str | None] = mapped_column(String(16), nullable=True)
     process_reaped: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # 仅保存固定检查阶段和稳定触发类别，详细原因保留在受保护日志中。
-    analysis_diagnostic: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # 缺少诊断时保存 SQL NULL，以满足诊断对象的数据库约束。
+    analysis_diagnostic: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     resume_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     resume_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
