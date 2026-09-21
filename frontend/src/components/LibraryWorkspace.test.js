@@ -460,8 +460,8 @@ describe('LibraryWorkspace', () => {
     await wrapper.get('.toolbar button').trigger('click')
     await flushPromises()
 
-    expect(images).toHaveBeenNthCalledWith(3, { search: '', page: 2, page_size: 50 })
-    expect(images).toHaveBeenNthCalledWith(4, { search: '', page: 1, page_size: 50 })
+    expect(images).toHaveBeenNthCalledWith(3, { search: '', page: 2, page_size: 50, sort: 'name_asc' })
+    expect(images).toHaveBeenNthCalledWith(4, { search: '', page: 1, page_size: 50, sort: 'name_asc' })
     expect(wrapper.text()).toContain('第 1 / 1 页，共 1 张')
     expect(wrapper.get('.library-preview-trigger img').attributes('src')).toBe('/media/meme-1')
     wrapper.unmount()

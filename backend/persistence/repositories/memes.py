@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select
@@ -19,6 +19,9 @@ from backend.image_naming import normalize_display_name, normalize_extension, sa
 from backend.paths import validate_business_storage_key
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import Meme, ScopeContext, StorageOperation, Task, utcnow
+
+
+ImageSort = Literal["name_asc", "updated_desc"]
 
 
 def _durable_meme_clause():
@@ -91,12 +94,18 @@ class MemeRepository:
         """返回 `by_content` 的语义别名，供上传和合集导入统一调用。"""
         return self.by_content(sha256, extension, for_update=for_update)
 
-    def list(self, *, search: str | None = None, page: int = 1, page_size: int = 200) -> list[Meme]:
-        """在数据库内按展示名称筛选、分页并稳定排序当前 scope 的 durable Meme。"""
+    def list(self, *, search: str | None = None, page: int = 1, page_size: int = 200, sort: ImageSort = "name_asc") -> list[Meme]:
+        """按名称或更新时间排序当前 scope 的图片，再返回指定页；名称忽略大小写。"""
+        if sort == "name_asc":
+            ordering = (func.lower(Meme.display_name).asc(), Meme.id.asc())
+        elif sort == "updated_desc":
+            ordering = (Meme.updated_at.desc(), Meme.id.desc())
+        else:
+            raise DatabaseError("invalid_image_sort", "图片排序方式必须为 name_asc 或 updated_desc")
         statement = select(Meme).where(*self._visible_predicate())
         if search:
             statement = statement.where(Meme.display_name.ilike(f"%{search}%"))
-        statement = statement.order_by(Meme.display_name.asc(), Meme.id.asc()).offset(max(0, page - 1) * page_size).limit(max(1, min(page_size, 200)))
+        statement = statement.order_by(*ordering).offset(max(0, page - 1) * page_size).limit(max(1, min(page_size, 200)))
         return list(self.session.scalars(statement))
 
     def count(self, *, search: str | None = None) -> int:

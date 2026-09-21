@@ -30,6 +30,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     Uuid,
+    func,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -126,6 +127,8 @@ class Meme(Base):
         UniqueConstraint("scope_id", "storage_key", name="uq_memes_scope_storage"),
         UniqueConstraint("scope_id", "sha256", "extension", name="uq_memes_scope_content"),
         Index("ix_memes_scope_display_name", "scope_id", "display_name", "id"),
+        Index("ix_memes_scope_name_lower", scope_id, func.lower(display_name), id),
+        Index("ix_memes_scope_updated", scope_id, updated_at.desc(), id.desc()),
         CheckConstraint("size_bytes >= 0", name="ck_memes_size_nonnegative"),
         CheckConstraint("context_status IN ('pending','partial','ready','repair_required')", name="ck_memes_context_status"),
         CheckConstraint("search_metadata_hash IS NULL OR length(search_metadata_hash) = 64", name="ck_memes_search_metadata_hash"),

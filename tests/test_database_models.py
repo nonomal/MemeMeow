@@ -20,7 +20,7 @@ from backend.persistence import models
 def test_single_forward_migration_head():
     """仓库只暴露一个前向 revision head，回滚由 migration 明确拒绝。"""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["0027_already_exited_termination_signal"]
+    assert script.get_heads() == ["0028_image_library_sort"]
     assert (Path("alembic/versions/0001_postgres_scoped.py")).is_file()
 
 

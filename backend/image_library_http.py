@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from backend.database import DatabaseError
 from backend.image_naming import public_filename_fields, saved_filename
 from backend.metadata import MetadataError
+from backend.persistence.repositories.memes import ImageSort
 from backend.public_dto import sanitize_public_timestamp
 from backend.services.thumbnails import ThumbnailError
 
@@ -52,6 +53,7 @@ async def list_images(
     search: str,
     page: int,
     page_size: int,
+    sort: ImageSort = "name_asc",
     services: ServicesProvider,
     environment: EnvironmentProvider,
     processing_repository: ProcessingRepositoryProvider,
@@ -64,12 +66,12 @@ async def list_images(
     最新处理摘要。调用场景是公共图片库只读请求，所有数据均从入口注入的当前 scope
     services/environment 派生。
     """
-    unknown = set(request.query_params) - {"search", "page", "page_size"}
+    unknown = set(request.query_params) - {"search", "page", "page_size", "sort"}
     if unknown:
         raise error(400, "invalid_request", "图片列表不接受已废弃的目录参数")
     scoped_services = services(request)
     with environment(request) as database_environment:
-        records = database_environment.memes.list(search=search, page=page, page_size=page_size)
+        records = database_environment.memes.list(search=search, page=page, page_size=page_size, sort=sort)
         total = database_environment.memes.count(search=search)
     valid_records = records
     # 图片列表复用数据库保存的 SHA 和大小，缩略图状态查询使用同一份记录。

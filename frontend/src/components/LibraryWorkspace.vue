@@ -46,6 +46,7 @@ type ProcessingOptionsTarget = 'unready' | 'selected'
 
 const images = shallowRef<MemeImage[]>([])
 const filter = shallowRef('')
+const sort = shallowRef('name_asc')
 const page = shallowRef(1)
 const pageSize = 50
 const total = shallowRef(0)
@@ -107,7 +108,7 @@ async function loadLibrary(): Promise<void> {
   emit('clearError')
   busy.value = true
   try {
-    const data = await api.images({ search: filter.value, page: page.value, page_size: pageSize })
+    const data = await api.images({ search: filter.value, page: page.value, page_size: pageSize, sort: sort.value })
     if (requestId !== libraryRequestId) return
     images.value = data.items
     total.value = Number.isInteger(data.total) ? data.total : data.items.length
@@ -131,9 +132,10 @@ async function loadLibrary(): Promise<void> {
   }
 }
 
-/** 将筛选结果切回第一页，避免旧页码超出新结果范围。 */
+/** 筛选或排序变化时返回第一页，并清理当前选择。 */
 function applyFilter(): void {
   page.value = 1
+  selectedImages.value = new Set()
   void loadLibrary()
 }
 
@@ -464,6 +466,10 @@ watch(() => props.refreshToken, () => { void loadLibrary() })
     </div>
     <div class="toolbar" aria-label="图片库工具">
       <input v-model="filter" aria-label="筛选文件名" placeholder="筛选文件名" @keyup.enter="applyFilter" />
+      <select v-model="sort" aria-label="图片排序方式" :disabled="retryBusy" @change="applyFilter">
+        <option value="name_asc">名称 A–Z</option>
+        <option value="updated_desc">最近更新</option>
+      </select>
       <button type="button" @click="loadLibrary">刷新</button>
       <span class="toolbar-spacer"></span>
       <div class="toolbar-group library-operations">
