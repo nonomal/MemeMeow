@@ -11,7 +11,7 @@
 ## 2. OpenCode 提醒插件
 
 - [x] 2.1 编写与生产 OpenCode `1.18.18` 匹配的本地 JavaScript 插件，通过当前 OpenCode 进程的 session SDK 投影读取冻结主 session 已完成请求的累计金额，不递归汇总子 session，也不自行重新计算 token 价格
-- [ ] 2.2 在 messages hook 中通过 `sdk.session.prompt()` 和 `noReply: true` 保存用户消息并加入本次模型输入，每个 attempt 最多提交一次“请尽快完成必要工作、验证结果并生成报告。”；验证消息持久化、TUI 消息接口和后续模型处理
+- [x] 2.2 在 messages hook 中通过 `sdk.session.prompt()` 和 `noReply: true` 保存用户消息并加入本次模型输入，每个 attempt 最多提交一次“请尽快完成必要工作、验证结果并生成报告。”；验证消息持久化、TUI 消息读取路径和后续模型处理
 - [x] 2.3 以 attempt 状态记录提醒结果，覆盖该 attempt 内的请求重试、上下文压缩和后续模型调用；恢复产生的新 attempt 可以再次提醒一次
 - [x] 2.4 对 session 缺失、用量读取失败和提示注入失败记录明确错误；运行期提醒失败允许任务继续，插件不调用终止流程
 - [x] 2.5 让任务配置显式引用镜像内只读插件并传入冻结策略、目标模型、模型等级、attempt 标识和策略版本
