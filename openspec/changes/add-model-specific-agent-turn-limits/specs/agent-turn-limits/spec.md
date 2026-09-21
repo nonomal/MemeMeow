@@ -48,11 +48,11 @@
 
 ### Requirement: 插件必须在达到提醒限额后尽力发送一次收尾提醒
 
-系统 MUST 使用 OpenCode 现有插件接口读取当前 attempt 主 session 已完成请求的累计金额。插件 MUST 只统计冻结的主 session。当累计金额达到或超过 `reminder_cost` 时，插件 MUST 调用 `sdk.v2.session.prompt()`，请求只包含 `sessionID`、`prompt.text` 和 `delivery: "steer"`，省略 `resume`。文字 MUST 为“请尽快完成必要工作、验证结果并生成报告。”。每个 attempt 最多提交一次提醒，恢复产生的新 attempt 拥有独立提醒状态并沿用同一 session 的累计金额。提醒作为当前 session 的用户输入持久化。插件 MUST 在异步检查前设置防重入状态，并在提交前设置已尝试提交；重入 hook 直接返回。成功返回 admission 后才设置 `reminder_sent=true`，通过现有 Unix socket 报告状态并记录 admission 标识。插件异常 MUST 保留阶段、错误类别和消息，Executor 独立执行金额终止。
+系统 MUST 使用 `experimental.chat.messages.transform` 读取当前 attempt 主 session 已完成请求的累计金额。插件 MUST 只统计冻结的主 session。当累计金额达到或超过 `reminder_cost` 时，插件 MUST 调用 `sdk.session.prompt()`，设置 `noReply: true`，沿用当前用户消息的 agent、model、variant、tools、system 和 format。文字 MUST 为“请尽快完成必要工作、验证结果并生成报告。”。每个 attempt 最多提交一次提醒，恢复产生的新 attempt 拥有独立提醒状态并沿用同一 session 的累计金额。提醒 MUST 保存为 TUI 消息接口可以读取的用户消息，并将返回的消息加入本次 hook 的 messages。插件 MUST 在异步检查前设置防重入状态，并在提交前设置已尝试提交；重入 hook 直接返回。保存成功且加入当前消息后才设置 `reminder_sent=true`，通过现有 Unix socket 报告状态并记录消息 ID。插件异常 MUST 保留阶段、错误类别和消息，Executor 独立执行金额终止。
 
 #### Scenario: 达到提醒限额
 - **WHEN** 某 attempt 的提醒金额限额为 0.10 美元，插件在下一次模型请求前确认主 session 已完成用量为 0.11 美元且尚未提醒
-- **THEN** 插件向主 session 提交一次 steer 输入，成功返回 admission 后记录该 attempt 已提醒
+- **THEN** 插件向主 session 保存一次用户提醒，加入本次模型输入后记录该 attempt 已提醒
 
 #### Scenario: 提醒不重复发送
 - **WHEN** 已提醒的 attempt 因模型重试、上下文压缩或后续请求再次满足提醒条件
@@ -62,9 +62,9 @@
 - **WHEN** 提醒提交发生网络错误、session 不存在或请求冲突
 - **THEN** 保留实际错误类别和消息，`reminder_sent` 保持 false，本 attempt 不自动重复提交
 
-#### Scenario: admission 与后续处理分别验收
-- **WHEN** OpenCode 返回提醒的消息 ID 和 admission 序号
-- **THEN** 该结果仅证明已接收输入；验收另外检查后续模型输入包含提醒、assistant 响应及最终 attempt 状态
+#### Scenario: 消息与任务结果分别验收
+- **WHEN** OpenCode 返回保存后的提醒消息
+- **THEN** 验收确认 TUI 消息接口可以读取提醒、本次模型输入包含提醒，并检查 assistant 响应及最终 attempt 状态
 
 #### Scenario: 子 session 不计入累计用量
 - **WHEN** OpenCode 历史中存在不属于冻结主 session 的子 session 或其他 session

@@ -33,7 +33,7 @@ function describeError(stage, error) {
   return `${stage}:${status ? `HTTP_${status}:` : ""}${reason}:${message}`;
 }
 
-/** 使用当前进程的 SDK transport 读取累计金额，每个 attempt 最多提交一次 steer 输入。 */
+/** 使用当前进程的 SDK transport 读取累计金额，每个 attempt 最多保存一次用户提醒。 */
 export default async function analysisReminder({ client }, options) {
   const { attempt_id, policy, socket_path, session_id } = options ?? {};
   if (!attempt_id || !socket_path || !policy || policy.version !== 1) {
@@ -64,21 +64,23 @@ export default async function analysisReminder({ client }, options) {
   let checking = false;
   let submissionStarted = false;
   return {
-    "experimental.chat.system.transform": async (input) => {
-      // prompt admission 可能引起 hook 重入；重入立即返回，不等待当前提交。
+    "experimental.chat.messages.transform": async (_input, output) => {
+      // 提醒保存期间的并发 hook 立即返回，不等待当前提交。
       if (checking || submissionStarted) return;
-      if (state.session_id && input.sessionID !== state.session_id) return;
+      const user = output.messages.findLast(message => message.info.role === "user")?.info;
+      const sessionID = user?.sessionID;
+      if (state.session_id && sessionID !== state.session_id) return;
       checking = true;
       let stage = "analysis_reminder_session_read";
       try {
         try {
-          if (!input.sessionID) throw new Error("analysis_reminder_session_missing");
+          if (!sessionID) throw new Error("analysis_reminder_session_missing");
           const response = await sdk.v2.session.get(
-            { sessionID: input.sessionID }, { throwOnError: true },
+            { sessionID }, { throwOnError: true },
           );
           const session = response.data.data;
           if (session.parentID) return;
-          if (session.id !== input.sessionID) throw new Error("analysis_reminder_session_mismatch");
+          if (session.id !== sessionID) throw new Error("analysis_reminder_session_mismatch");
           state.session_id = session.id;
           if (typeof session.cost !== "number" || !Number.isFinite(session.cost) || session.cost < 0) {
             throw new Error("analysis_reminder_cost_invalid");
@@ -87,15 +89,23 @@ export default async function analysisReminder({ client }, options) {
             // 响应丢失时无法确认服务端是否已接收，因此本 attempt 不重复提交。
             submissionStarted = true;
             stage = "analysis_reminder_prompt_submit";
-            const admitted = await sdk.v2.session.prompt(
-              { sessionID: session.id, prompt: { text: reminder }, delivery: "steer" },
+            const saved = await sdk.session.prompt(
+              {
+                sessionID, noReply: true, parts: [{ type: "text", text: reminder }],
+                agent: user.agent, model: user.model, variant: user.model.variant,
+                tools: user.tools, system: user.system, format: user.format,
+              },
               { throwOnError: true },
             );
+            if (saved.data?.info?.role !== "user" || saved.data.info.sessionID !== sessionID) {
+              throw new Error("analysis_reminder_message_invalid");
+            }
+            // hook 的消息快照早于保存操作；加入真实消息后，本次模型请求即可读取提醒。
+            output.messages.push(saved.data);
             state.reminder_sent = true;
             console.info(JSON.stringify({
-              event: "analysis_reminder_admitted", attempt_id,
-              session_id: session.id, message_id: admitted.data.data.id,
-              admitted_seq: admitted.data.data.admittedSeq,
+              event: "analysis_reminder_message_included", attempt_id,
+              session_id: session.id, message_id: saved.data.info.id,
             }));
           }
           state.error = null;

@@ -46,13 +46,13 @@ Server 初始策略如下：
 
 ### 3. 插件读取主 session 用量并发送一次提醒
 
-插件使用 `experimental.chat.system.transform`，从当前请求取得 `sessionID`，通过 OpenCode SDK 读取冻结主 session 已完成请求的累计金额。插件不自行计算 token 价格，也不汇总子 session 或其他 session。
+插件使用 `experimental.chat.messages.transform`，从当前用户消息取得 `sessionID`，通过 OpenCode SDK 读取冻结主 session 已完成请求的累计金额。插件不自行计算 token 价格，也不汇总子 session 或其他 session。
 
-累计金额达到 `reminder_cost` 后，插件调用 `sdk.v2.session.prompt({ sessionID, prompt: { text }, delivery: "steer" }, { throwOnError: true })`，省略 `resume`，文字为“请尽快完成必要工作、验证结果并生成报告。”。提醒作为当前主 session 的用户输入被持久化，后续 Agent 回合按照 OpenCode 调度读取。
+累计金额达到 `reminder_cost` 后，插件调用 `sdk.session.prompt()`，设置 `noReply: true`，文字为“请尽快完成必要工作、验证结果并生成报告。”，沿用当前用户消息的 agent、model、variant、tools、system 和 format。OpenCode 保存用户消息后立即返回，TUI 通过同一消息接口读取提醒。插件将返回的真实消息加入当前 hook 的 messages，使即将发送的模型请求包含提醒。
 
-插件在异步读取前设置处理中状态，重入 hook 直接返回；提交前设置本 attempt 已尝试提交，成功收到 admission 后才设置 `reminder_sent=true`。通过 Executor 创建的 Unix socket 报告状态，日志记录消息 ID 和 admission 序号。请求失败或响应丢失时保留阶段、错误类别和消息，本 attempt 不自动重复提交。请求重试、上下文压缩和后续调用均不重复提醒。恢复产生的新 attempt 拥有独立提醒状态，并继续读取同一 session 的累计金额。
+插件在异步读取前设置处理中状态，重入 hook 直接返回；提交前设置本 attempt 已尝试提交，保存成功且加入当前消息后才设置 `reminder_sent=true`。通过 Executor 创建的 Unix socket 报告状态，日志记录消息 ID。请求失败或响应丢失时保留阶段、错误类别和消息，本 attempt 不自动重复提交。请求重试、上下文压缩和后续调用均不重复提醒。恢复产生的新 attempt 拥有独立提醒状态，并继续读取同一 session 的累计金额。
 
-例如提醒金额为 0.10 美元、主 session 已用 0.11 美元时，插件提交一条 steer 输入。admission 成功只表示已接收；验收另外检查后续模型输入包含提醒、assistant 响应以及最终 attempt 状态。
+例如提醒金额为 0.10 美元、主 session 已用 0.11 美元时，插件保存一条用户提醒并加入本次模型输入。验收检查消息持久化、TUI 消息接口、模型处理证据及最终 attempt 状态；提醒状态不代表任务完成。
 
 插件状态绑定 attempt 标识、策略版本、插件版本和 session。运行期间无法读取用量或追加提示时，插件记录明确错误并允许任务继续；Executor 的终止判断不读取插件提醒结果。
 
