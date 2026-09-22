@@ -50,7 +50,7 @@ async def operation_availability(
             continue
         item = {"operation": name, "available": bool(decision.allowed)}
         if not decision.allowed:
-            item["reason"] = decision.reason if decision.reason in {"operation_forbidden", "operation_limit_exceeded", "operation_policy_unavailable"} else "operation_policy_unavailable"
+            item["reason"] = decision.reason if decision.reason in {"operation_forbidden", "operation_limit_exceeded", "operation_daily_limit_exceeded", "operation_policy_unavailable"} else "operation_policy_unavailable"
         if decision.retry_at is not None:
             item["retry_at"] = decision.retry_at.isoformat() if isinstance(decision.retry_at, datetime) else str(decision.retry_at)
         values.append(item)

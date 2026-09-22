@@ -43,6 +43,7 @@ class OperationPolicyError(RuntimeError):
     _messages = {
         "operation_forbidden": "当前操作未被允许",
         "operation_limit_exceeded": "当前操作暂不可用",
+        "operation_daily_limit_exceeded": "今日操作额度已用完，请在额度恢复后重试",
         "operation_policy_unavailable": "操作策略暂不可用",
         "operation_unknown": "操作类型无效",
         "operation_grant_invalid": "操作授权无效",
@@ -264,7 +265,7 @@ def _decision(value: object, *, grant: GrantRef | None = None) -> PolicyDecision
 def require_allowed(result: PolicyDecision) -> GrantRef:
     """将 acquire 拒绝转换为稳定异常，并返回不可伪造 grant。"""
     if not result.allowed or result.grant is None:
-        code = result.reason if result.reason in {"operation_forbidden", "operation_limit_exceeded", "operation_policy_unavailable"} else "operation_policy_unavailable"
+        code = result.reason if result.reason in {"operation_forbidden", "operation_limit_exceeded", "operation_daily_limit_exceeded", "operation_policy_unavailable"} else "operation_policy_unavailable"
         raise OperationPolicyError(code, retry_at=result.retry_at)
     return result.grant
 

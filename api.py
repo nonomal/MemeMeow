@@ -317,7 +317,7 @@ def _release_operation(request: Request, grant) -> None:
 
 def _operation_http_error(exc: OperationPolicyError) -> HTTPException:
     """映射稳定 policy 错误，不泄露 policy 原始诊断。"""
-    status = 403 if exc.code == "operation_forbidden" else 429 if exc.code == "operation_limit_exceeded" else 503
+    status = 403 if exc.code == "operation_forbidden" else 429 if exc.code in {"operation_limit_exceeded", "operation_daily_limit_exceeded"} else 503
     return _error(status, exc.code, str(exc))
 
 
