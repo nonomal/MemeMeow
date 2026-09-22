@@ -31,6 +31,7 @@ const UPLOAD_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   metadata_write_failed: '图片保存失败，请稍后重试',
   operation_forbidden: '当前账户暂不允许上传图片',
   operation_limit_exceeded: '已达到图片上传额度限制',
+  operation_daily_limit_exceeded: '今日图片上传额度已用完，北京时间次日零点恢复',
   operation_policy_unavailable: '上传服务暂不可用，请稍后重试',
   operation_grant_invalid: '上传授权无效，请稍后重试',
   operation_unknown: '上传操作类型无效',
