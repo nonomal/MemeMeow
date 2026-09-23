@@ -33,6 +33,7 @@ frontend/coverage/
 # Local logs and ad-hoc sample files
 *.log
 example_meme_1.jpg
+.local-real-test/
 
 /data/models/*
 config/config.yaml

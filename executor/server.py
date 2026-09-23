@@ -65,6 +65,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - Agent 镜像只复制 e
 from executor.agent_limits import validate_agent_concurrency
 from executor.analysis_policy import AnalysisPolicyError, parse_analysis_policy
 from executor.analysis_monitor import AnalysisMonitor, AnalysisControlError
+from executor.attempt_diagnostics import AttemptOutput, configure_executor_diagnostics, stream_sample as _stream_sample
 from executor.process_supervisor import ProcessSupervisor
 from executor.result_store import ExecutorResultStore, ExecutorResultStoreError
 from executor.task_queue import ExecutionQueue
@@ -304,18 +305,6 @@ def _diagnostic(stdout: bytes, stderr: bytes, *, secrets: tuple[str, ...] = ()) 
             if isinstance(message, str) and message.strip():
                 return _redact_diagnostic(message.strip(), secrets)
     return "OpenCode 进程执行失败"
-
-
-def _stream_sample(stream: Any, limit: int) -> bytes:
-    """读取临时输出的头尾样本，避免大 JSONL 将 provider 错误留在不可见尾部。"""
-    stream.seek(0)
-    head = stream.read(limit)
-    stream.seek(0, os.SEEK_END)
-    size = stream.tell()
-    if size <= limit:
-        return head
-    stream.seek(max(0, size - limit))
-    return head + b"\n" + stream.read(limit)
 
 
 def _relative_image_path(value: object) -> Path:
@@ -1311,12 +1300,20 @@ class Executor:
         )
 
     def _run(self, task: TaskState) -> None:
-        """执行单个固定 OpenCode 任务并更新状态，失败时只保存稳定诊断。"""
+        """执行 OpenCode 任务并更新状态，失败时保存脱敏后的有限诊断。"""
         process: subprocess.Popen[bytes] | None = None
         stdout = b""
         stderr = b""
         timed_out = False
         analysis_socket: socket.socket | None = None
+        output = AttemptOutput()
+        monitor = None
+        started = time.monotonic()
+        diagnostic_secrets = secret_inventory_from_mapping(os.environ) + (
+            self.legacy_api_key, self.token, task.callback_token or "",
+            task.workspace_capability or "", task.model_capability or "",
+            task.session_id or "",
+        )
         try:
             with self.lock:
                 if task.cancel_event.is_set():
@@ -1342,6 +1339,7 @@ class Executor:
                         if path.exists() or path.is_symlink():
                             path.unlink()
             env = self._task_environment(task)
+            diagnostic_secrets += secret_inventory_from_mapping(env)
             image_root = task.images_root or IMAGE_ROOT
             image = image_root / _relative_image_path(task.image_relative_path)
             try:
@@ -1390,8 +1388,10 @@ class Executor:
                 command.extend(("--session", task.session_id))
             command.append(self._prompt(task))
             command = self._sandbox_command(task, command)
-            with tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as out, tempfile.TemporaryFile(dir=LOG_ROOT, prefix=f"{task.task_id}-", mode="w+b") as err:
+            output.phase = "process_start"
+            with output.capture(LOG_ROOT, task.task_id) as (out, err):
                 process = subprocess.Popen(command, cwd=process_directory, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+                output.phase = "process_running"
                 with self.lock:
                     task.process = process
                     # 进程启动后，只有父进程确认 waitpid 收束才允许该 attempt 作为续跑源。
@@ -1428,7 +1428,9 @@ class Executor:
                         timed_out = True
                         break
                     if monitor is not None:
+                        output.phase = "analysis_monitor"
                         self._check_analysis(task, monitor, process, out)
+                        output.phase = "process_running"
                     time.sleep(0.05)
                 if process.poll() is not None:
                     with self.lock:
@@ -1436,16 +1438,21 @@ class Executor:
                 out.flush()
                 err.flush()
                 # session 必须从完整 stdout 流解析；采样只保留给有限错误诊断。
+                output.phase = "session_capture"
                 self._capture_session(task, out)
                 if monitor is not None and not timed_out and not task.cancel_event.is_set():
+                    output.phase = "analysis_monitor"
                     self._check_analysis(task, monitor, process, out, exited=True)
                 stdout = _stream_sample(out, 256 * 1024)
                 stderr = _stream_sample(err, 16 * 1024)
             if task.cancel_event.is_set():
+                output.phase = "process_cancelled"
                 raise RuntimeError("task_interrupted")
             if timed_out:
+                output.phase = "process_timeout"
                 raise _ProcessFailure("agent_timeout", "OpenCode 执行超时")
             if process.returncode != 0:
+                output.phase = "process_exit"
                 code, http_status = self._classify_process_failure(stdout, stderr)
                 raise _ProcessFailure(
                     code,
@@ -1454,6 +1461,7 @@ class Executor:
                 )
             if not task.session_id:
                 raise RuntimeError("agent_output_invalid_json")
+            output.phase = "result_validation"
             self._validate_result_file(RESULT_ROOT / task.task_id / RESULT_FILE_NAME)
             with self.lock:
                 if task.cancel_event.is_set():
@@ -1531,10 +1539,25 @@ class Executor:
                 try:
                     self._persist_attempt_metadata(task)
                 except (OSError, ValueError, TypeError):
-                    # 元数据仅用于跨重启诊断；写入失败不能让当前任务悬挂，
-                    # 但此时新 executor 必须因缺少签名事实而拒绝自动续跑。
+                    # 元数据写入失败时，后续恢复会因缺少签名事实被拒绝。
                     pass
                 task.done.set()
+            if task.status in {"failed", "cancelled"}:
+                secrets = diagnostic_secrets + (task.session_id or "",)
+                redact = lambda value: _redact_diagnostic(str(value), secrets)
+                output.log_failure(
+                    redact=redact, task_id=task.business_task_id, attempt_id=task.executor_attempt_id,
+                    resume=task.is_resume, status=task.status,
+                    error_code=(task.error or {}).get("error"),
+                    error_message=redact((task.error or {}).get("message", "")),
+                    return_code=process.poll() if process is not None else None,
+                    process_reaped=task.process_reaped, timed_out=timed_out,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    failure_reason=redact(monitor.failure_reason or "") if monitor else None,
+                    plugin_ready=monitor.ready if monitor else None,
+                    plugin_error=redact(monitor.reminder_error or "") if monitor else None,
+                    plugin_error_detail=redact(monitor.reminder_error_detail or "") if monitor else None,
+                )
 
     def _check_analysis(self, task: TaskState, monitor: AnalysisMonitor, process: subprocess.Popen[bytes], stdout: Any, *, exited: bool = False) -> None:
         """检查冻结 attempt 的金额和插件，触发时确认进程回收后发布稳定错误。"""
@@ -1549,6 +1572,7 @@ class Executor:
         except (AnalysisControlError, RuntimeError) as exc:
             code = exc.code if isinstance(exc, AnalysisControlError) else "agent_analysis_usage_unavailable"
             reason = exc.reason if isinstance(exc, AnalysisControlError) else str(exc)
+            monitor.failure_reason = reason
             termination = self.process_supervisor.terminate(process)
             reaped = termination.reaped
             signal_name: str | None = None
@@ -1863,6 +1887,7 @@ class ExecutorHTTPServer(ThreadingHTTPServer):
 
 def main() -> None:
     """启动 executor；端口只由容器内部环境配置，不发布到宿主机。"""
+    configure_executor_diagnostics(Path(os.getenv("MEMEMEOW_EXECUTOR_DIAGNOSTICS_ROOT", str(RUNTIME_ROOT / "executor-logs"))))
     host = os.getenv("MEMEMEOW_AGENT_EXECUTOR_HOST", "0.0.0.0")
     port = _env_int("MEMEMEOW_AGENT_EXECUTOR_PORT", 8277, 1, 65535)
     executor = Executor()

@@ -44,6 +44,8 @@ class AnalysisMonitor:
     ready: bool = False
     next_check: float = 0
     reminder_error: str | None = None
+    reminder_error_detail: str | None = None
+    failure_reason: str | None = None
 
     def check(self, session_id: str | None, *, exited: bool = False) -> None:
         """轮询当前 attempt 的就绪及金额；终止原因通过异常交给进程管理者。"""
@@ -70,6 +72,7 @@ class AnalysisMonitor:
             self.ready = status.get("ready") is True
             self.reminder_sent = self.reminder_sent or status.get("reminder_sent") is True
             self.reminder_error = status.get("error") if isinstance(status.get("error"), str) else None
+            self.reminder_error_detail = status.get("error_detail") if isinstance(status.get("error_detail"), str) else None
             if not self.ready and self.reminder_error:
                 if self.reminder_error not in {
                     "analysis_plugin_runtime_version_incompatible",
