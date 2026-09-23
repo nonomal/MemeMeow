@@ -386,9 +386,12 @@ class DerivedThumbnailService:
         """
         projected: dict[str, object]
         should_enqueue = False
+        source_error = self._source_identity_error(meme, source_identity)
+        with self.resources.environment(self.scope) as environment:
+            snapshot = environment.thumbnails.current(meme, self.config.profile)
+        output_valid = snapshot is not None and snapshot.status == "available" and self._output_is_valid(meme, snapshot)
         with self.resources.environment(self.scope) as environment:
             row = environment.thumbnails.current(meme, self.config.profile)
-            source_error = self._source_identity_error(meme, source_identity)
             if row is None and ensure and source_error is None:
                 try:
                     row = environment.thumbnails.ensure_pending(meme, self.config.profile)
@@ -409,7 +412,7 @@ class DerivedThumbnailService:
                     projected = {"status": "stale", "media_url": None}
                 should_enqueue = False
             else:
-                if row is not None and row.status == "available" and not self._output_is_valid(meme, row):
+                if row is not None and row.status == "available" and snapshot is not None and row.updated_at == snapshot.updated_at and not output_valid:
                     self._mark_row_stale(row, "thumbnail_output_unavailable")
                     environment.uow.session.flush()
                 projected = self._projection(row, meme_id=meme.id)
@@ -503,13 +506,16 @@ class DerivedThumbnailService:
         if meme is None:
             return
         with self.resources.environment(self.scope) as environment:
+            snapshot = environment.thumbnails.current(meme, self.config.profile)
+        output_valid = snapshot is not None and snapshot.status == "available" and self._output_is_valid(meme, snapshot)
+        with self.resources.environment(self.scope) as environment:
             current = environment.memes.get(meme.id, for_update=True)
             if current is None or current.sha256.lower() != str(meme.sha256).lower() or current.size_bytes != meme.size_bytes:
                 return
             existing = environment.thumbnails.current(current, self.config.profile, for_update=True)
             # 另一 Worker 可能已经以同一确定输出完成；失败 Worker 不能把成功事实
             # 回写成 failed。输出身份通过同一严格校验，损坏的 available 仍可重建。
-            if existing is not None and existing.status == "available" and self._output_is_valid(current, existing):
+            if existing is not None and existing.status == "available" and (snapshot is None or existing.updated_at != snapshot.updated_at or output_valid):
                 return
             diagnostic: dict[str, object] = {"error": code, "updated_at": utcnow().isoformat()}
             if elapsed_ms is not None:
@@ -517,6 +523,24 @@ class DerivedThumbnailService:
             environment.thumbnails.mark_failed(current, self.config.profile, diagnostic)
 
     def generate(
+        self,
+        meme_id: UUID | str,
+        *,
+        source_sha256: str | None = None,
+        source_size_bytes: int | None = None,
+        profile: str | None = None,
+    ) -> dict[str, object]:
+        """通过原图共享身份锁协调生成、删除和恢复，锁等待不占用数据库连接。"""
+        snapshot = self._meme(meme_id)
+        source_store = self.resources.blob_store_for_scope(self.scope)
+        with source_store.identity_lock(snapshot.sha256, snapshot.extension):
+            return self._generate_locked(
+                meme_id, source_sha256=source_sha256 or snapshot.sha256,
+                source_size_bytes=source_size_bytes if source_size_bytes is not None else snapshot.size_bytes,
+                profile=profile,
+            )
+
+    def _generate_locked(
         self,
         meme_id: UUID | str,
         *,
@@ -543,8 +567,10 @@ class DerivedThumbnailService:
                 raise ThumbnailError("thumbnail_source_changed")
             with self.resources.environment(self.scope) as environment:
                 row = environment.thumbnails.current(meme, self.config.profile, for_update=True)
-                if row is not None and row.status == "available" and self._output_is_valid(meme, row):
-                    return self._projection(row, meme_id=meme.id)
+            if row is not None and row.status == "available" and self._output_is_valid(meme, row):
+                return self._projection(row, meme_id=meme.id)
+            with self.resources.environment(self.scope) as environment:
+                row = environment.thumbnails.current(meme, self.config.profile, for_update=True)
                 if row is not None and row.status == "available":
                     self._mark_row_stale(row, "thumbnail_output_unavailable")
                     environment.uow.session.flush()
@@ -564,40 +590,21 @@ class DerivedThumbnailService:
                 raise ThumbnailError("thumbnail_output_invalid")
             output_key = self._output_key(current_meme, self.config.profile)
             output_sha = hashlib.sha256(rendered.content).hexdigest()
+            if not self.store.exists_with_identity(output_key, sha256=output_sha, size_bytes=len(rendered.content)):
+                staged_key = self.store.stage_bytes(rendered.content, token=uuid4())
+                target = self.store._key_path(output_key, must_exist=False)
+                if target.exists():
+                    self.store.unlink(output_key)
+                self.store.link_move(staged_key, output_key)
+                staged_key = None
+                installed_output_key = output_key
+                installed_output_sha = output_sha
+                installed_output_size = len(rendered.content)
             with self.resources.environment(self.scope) as environment:
-                # 生成 Worker 在安装文件前锁住父 Meme，并一直持锁到派生事实提交；
-                # 删除事务因此能在最终快照中看到本次输出，避免留下 orphan 文件。
+                # 文件安装由共享身份锁保护；短事务重新核对父记录后发布结果。
                 final_meme = environment.memes.get(current_meme.id, for_update=True)
                 if final_meme is None or final_meme.sha256.lower() != str(meme.sha256).lower() or final_meme.size_bytes != meme.size_bytes:
                     raise ThumbnailError("thumbnail_source_changed")
-                if not self.store.exists_with_identity(output_key, sha256=output_sha, size_bytes=len(rendered.content)):
-                    token = uuid4()
-                    staged_key = self.store.stage_bytes(rendered.content, token=token)
-                    if staged_key is not None:
-                        try:
-                            self.store.link_move(staged_key, output_key)
-                        except DatabaseError as exc:
-                            if exc.code != "target_exists":
-                                raise
-                            # link_move 的目标检查和链接之间仍存在窗口；同一
-                            # 指纹已经原子落位时，后到者直接复用成功输出。
-                            if self.store.exists_with_identity(output_key, sha256=output_sha, size_bytes=len(rendered.content)):
-                                self.store.unlink(staged_key)
-                                staged_key = None
-                            else:
-                                # 目标是旧损坏文件，允许本次重建替换；若另一个 Worker
-                                # 同时修复，下一次 target_exists 会重新按指纹判定。
-                                self.store.unlink(output_key)
-                                self.store.link_move(staged_key, output_key)
-                                staged_key = None
-                                installed_output_key = output_key
-                                installed_output_sha = output_sha
-                                installed_output_size = len(rendered.content)
-                        else:
-                            staged_key = None
-                            installed_output_key = output_key
-                            installed_output_sha = output_sha
-                            installed_output_size = len(rendered.content)
                 environment.thumbnails.mark_available(
                     final_meme,
                     self.config.profile,
@@ -647,12 +654,16 @@ class DerivedThumbnailService:
         """建立或复用当前源版本的 durable 缩略图任务，不触碰用户配额。"""
         if self.task_service is None or not any(callable(getattr(self.task_service, name, None)) for name in ("submit_thumbnail", "submit")):
             raise ThumbnailError("thumbnail_task_unavailable")
+        snapshot_meme = self._meme(meme_id)
+        with self.resources.environment(self.scope) as environment:
+            snapshot = environment.thumbnails.current(snapshot_meme, self.config.profile)
+        output_valid = snapshot is not None and snapshot.status == "available" and self._output_is_valid(snapshot_meme, snapshot)
         with self.resources.environment(self.scope) as environment:
             meme = environment.memes.get(meme_id)
             if meme is None:
                 raise ThumbnailError("meme_not_found")
             row = environment.thumbnails.ensure_pending(meme, self.config.profile, reset_failed=reset_failed)
-            if row.status == "available" and self._output_is_valid(meme, row):
+            if row.status == "available" and (snapshot is None or row.updated_at != snapshot.updated_at or output_valid):
                 return None
             if row.status == "available":
                 self._mark_row_stale(row, "thumbnail_output_unavailable")
@@ -806,13 +817,25 @@ class DerivedThumbnailService:
             row = environment.thumbnails.current(meme, self.config.profile)
             if row is None or row.status != "available" or not row.output_key:
                 raise ThumbnailError("thumbnail_not_found")
-            if not self._output_is_valid(meme, row):
-                self._mark_row_stale(row, "thumbnail_output_unavailable")
-                environment.uow.session.flush()
-                raise ThumbnailError("thumbnail_not_found")
-            return self.store.resolve(row.output_key, must_exist=True), row.media_type or THUMBNAIL_OUTPUT_MEDIA_TYPE
+        if not self._output_is_valid(meme, row):
+            with self.resources.environment(self.scope) as environment:
+                current = environment.thumbnails.current(meme, self.config.profile, for_update=True)
+                if current is not None and current.updated_at == row.updated_at:
+                    self._mark_row_stale(current, "thumbnail_output_unavailable")
+            raise ThumbnailError("thumbnail_not_found")
+        return self.store.resolve(row.output_key, must_exist=True), row.media_type or THUMBNAIL_OUTPUT_MEDIA_TYPE
 
     def cleanup_for_meme(self, meme_id: UUID | str) -> int:
+        """在原图身份锁内清理派生内容，与生成和删除使用同一互斥规则。"""
+        with self.resources.environment(self.scope) as environment:
+            snapshot = environment.memes.get(meme_id)
+        if snapshot is None:
+            return 0
+        source_store = self.resources.blob_store_for_scope(self.scope)
+        with source_store.identity_lock(snapshot.sha256, snapshot.extension):
+            return self._cleanup_for_meme_locked(meme_id)
+
+    def _cleanup_for_meme_locked(self, meme_id: UUID | str) -> int:
         """清理指定 Meme 的派生文件和事实，供删除及离线恢复使用。"""
         try:
             identifier = meme_id if isinstance(meme_id, UUID) else UUID(str(meme_id))
@@ -830,11 +853,11 @@ class DerivedThumbnailService:
                 )
             )
             keys = [row.output_key for row in rows if row.output_key]
-            if meme is not None:
-                keys.extend(self._thumbnail_file_keys(meme))
             for row in rows:
                 self._mark_row_stale(row, "meme_cleanup_in_progress")
             environment.uow.session.flush()
+        if meme is not None:
+            keys.extend(self._thumbnail_file_keys(meme))
         removed = 0
         for key in dict.fromkeys(keys):
             try:
@@ -846,8 +869,7 @@ class DerivedThumbnailService:
                 raise ThumbnailError("thumbnail_cleanup_failed") from exc
         try:
             with self.resources.environment(self.scope) as environment:
-                # 文件清理期间生成 Worker 可能已把新事实提交；锁住父 Meme 后重读
-                # 全部 key，覆盖首次收集与最终删除之间的窗口。
+                # 文件锁保护清理窗口，最终短事务重新收集数据库记录。
                 meme = environment.memes.get(identifier, for_update=True)
                 final_rows = list(
                     environment.uow.session.scalars(
@@ -858,8 +880,6 @@ class DerivedThumbnailService:
                     )
                 )
                 keys.extend(row.output_key for row in final_rows if row.output_key)
-                if meme is not None:
-                    keys.extend(self._thumbnail_file_keys(meme))
                 for row in final_rows:
                     self._mark_row_stale(row, "meme_cleanup_in_progress")
                 environment.thumbnails.delete_for_meme(identifier)

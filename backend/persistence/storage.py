@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,7 @@ from backend.image_naming import content_addressed_key, normalize_display_name, 
 from backend.paths import SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.storage_security import StorageRootError, validate_controlled_root
 from backend.persistence.engine import DatabaseError, SCOPE_LOCAL
+from backend.persistence.file_lock import shared_file_lock
 from backend.persistence.models import DerivedImageThumbnail, Meme, ScopeContext, StorageOperation, Task, utcnow
 
 if TYPE_CHECKING:
@@ -78,6 +79,11 @@ class BlobStore:
         if must_exist and (not candidate.is_file() or candidate.is_symlink()):
             raise DatabaseError("file_not_found")
         return candidate
+
+    def identity_lock(self, digest: str, extension: str):
+        """按当前 scope 的内容身份取得共享文件锁，供全部原图与派生修改入口使用。"""
+        key = content_addressed_key(digest, extension)
+        return shared_file_lock(self.root / ".locks" / f"{key}.lock")
 
     def relative(self, path: Path) -> str:
         """返回绑定根目录下的 POSIX storage_key。"""
@@ -258,40 +264,9 @@ class StorageCoordinator:
 
     @contextmanager
     def _identity_lock(self, digest: str, extension: str) -> Iterator[Session | None]:
-        """在 PostgreSQL 中锁定当前 scope 的图片内容身份直到文件操作完成。
-
-        上传会先提交 Meme 和 prepared operation，再执行文件落位；仅使用事务锁会在
-        这两个动作之间留下重复上传的可见窗口。Session 级 advisory lock 跨越两个短
-        事务，并复用同一连接，因此连接池只有一个可用连接时也不会自相等待。非
-        PostgreSQL 的替身资源不执行数据库专属锁，保持离线单元测试的可用性。
-        """
-        dialect = getattr(getattr(getattr(self.resources, "engine", None), "dialect", None), "name", None)
-        if dialect != "postgresql":
+        """在短事务之外持有图片身份锁，等待与文件处理均不申请数据库连接。"""
+        with self.blob_store.identity_lock(digest, extension):
             yield None
-            return
-
-        # Session-level advisory lock 绑定到显式 Connection。SQLAlchemy Session 在
-        # commit 后会把连接归还连接池；若让解锁重新 checkout 连接，可能在另一条
-        # PostgreSQL 会话上执行 pg_advisory_unlock，从而把原锁永久留在池中。
-        lock_connection = self.resources.engine.connect()
-        lock_session = Session(bind=lock_connection, expire_on_commit=False)
-        lock_key = f"mememeow:upload:{self.scope.scope_id}:{digest}:{extension}"
-        acquired = False
-        try:
-            lock_connection.execute(text("SELECT pg_advisory_lock(hashtext(:key))"), {"key": lock_key})
-            lock_connection.commit()
-            acquired = True
-            yield lock_session
-        finally:
-            try:
-                if acquired:
-                    lock_connection.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": lock_key})
-                    lock_connection.commit()
-                else:
-                    lock_connection.rollback()
-            finally:
-                lock_session.close()
-                lock_connection.close()
 
     @staticmethod
     def _thumbnail_keys(operation: StorageOperation) -> list[str]:
@@ -489,6 +464,8 @@ class StorageCoordinator:
             # 暂存先于数据库写入，避免把请求缓冲直接暴露为可见文件；身份锁会让并发
             # 请求在首个请求完成文件落位后再读取 durable 事实。
             if target.exists() or target.is_symlink():
+                if not self.blob_store.exists_with_identity(physical_key, sha256=digest, size_bytes=len(content)):
+                    raise DatabaseError("upload_reconciliation_required")
                 with self._transaction(lock_session) as session:
                     existing = session.scalar(
                         select(Meme)
@@ -500,8 +477,6 @@ class StorageCoordinator:
                         .with_for_update()
                     )
                     if existing is None or existing.storage_key != physical_key:
-                        raise DatabaseError("upload_reconciliation_required")
-                    if not self.blob_store.exists_with_identity(physical_key, sha256=digest, size_bytes=len(content)):
                         raise DatabaseError("upload_reconciliation_required")
                     return existing
 
@@ -517,11 +492,7 @@ class StorageCoordinator:
                     .with_for_update()
                 )
                 if existing is not None:
-                    if existing.storage_key != physical_key or not self.blob_store.exists_with_identity(physical_key, sha256=digest, size_bytes=len(content)):
-                        raise DatabaseError("upload_reconciliation_required")
-                    if staging_key is not None and self.blob_store.exists_with_identity(staging_key, sha256=digest, size_bytes=len(content)):
-                        self.blob_store.unlink(staging_key)
-                    return existing
+                    raise DatabaseError("upload_reconciliation_required")
 
                 from backend.metadata import MemeContext, semantic_document_hash
 
@@ -726,6 +697,12 @@ class StorageCoordinator:
                 expected_display_name = normalize_display_name(expected_display_name)
             except ValueError as exc:
                 raise DatabaseError("target_changed") from exc
+        with self.resources.environment(self.scope) as environment:
+            snapshot = environment.memes.get(identifier)
+        if snapshot is None or not self.blob_store.exists_with_identity(
+            snapshot.storage_key, sha256=snapshot.sha256, size_bytes=snapshot.size_bytes,
+        ):
+            raise DatabaseError("target_changed")
         with self._transaction() as session:
             record = session.scalar(
                 select(Meme)
@@ -760,11 +737,7 @@ class StorageCoordinator:
                 raise DatabaseError("display_name_changed")
             if record.revision != expected_revision:
                 raise DatabaseError("target_changed")
-            if not self.blob_store.exists_with_identity(
-                record.storage_key,
-                sha256=record.sha256,
-                size_bytes=record.size_bytes,
-            ):
+            if (record.storage_key, record.sha256, record.size_bytes) != (snapshot.storage_key, snapshot.sha256, snapshot.size_bytes):
                 raise DatabaseError("target_changed")
             unsettled_operation = session.scalar(
                 select(StorageOperation)
@@ -818,6 +791,15 @@ class StorageCoordinator:
             expected_display_name=expected_display_name,
         )
     def delete(self, meme_id: UUID | str) -> None:
+        """读取内容身份后在共享文件锁内完成删除，等待期间不持有事务。"""
+        with self.resources.environment(self.scope) as environment:
+            snapshot = environment.memes.get(meme_id)
+            if snapshot is None:
+                raise DatabaseError("meme_not_found")
+        with self.blob_store.identity_lock(snapshot.sha256, snapshot.extension):
+            self._delete_locked(meme_id, snapshot)
+
+    def _delete_locked(self, meme_id: UUID | str, snapshot: Meme) -> None:
         """先阻断派生访问并隔离原图，再删除 Meme 记录和派生对象。"""
         token = uuid.uuid4()
         thumbnail_keys: list[str] = []
@@ -825,18 +807,21 @@ class StorageCoordinator:
         delete_identity: tuple[UUID, str, int] | None = None
         before_sha256: str | None = None
         before_size: int | None = None
+        if not self.blob_store.exists_with_identity(snapshot.storage_key, sha256=snapshot.sha256, size_bytes=snapshot.size_bytes):
+            raise DatabaseError("target_changed")
+        file_keys = self._thumbnail_file_keys(snapshot.id, snapshot.sha256)
         with self._transaction() as session:
             record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
             if record is None:
                 raise DatabaseError("meme_not_found")
-            if not self.blob_store.exists_with_identity(record.storage_key, sha256=record.sha256, size_bytes=record.size_bytes):
+            if (record.storage_key, record.sha256, record.size_bytes) != (snapshot.storage_key, snapshot.sha256, snapshot.size_bytes):
                 raise DatabaseError("target_changed")
             before_sha256 = str(record.sha256).lower()
             before_size = record.size_bytes
             delete_identity = (record.id, before_sha256, before_size)
             delete_marker = self._delete_identity_marker(*delete_identity)
             thumbnail_rows = self._thumbnail_rows(session, record.id)
-            thumbnail_keys = self._thumbnail_keys_for_record(session, record, rows=thumbnail_rows)
+            thumbnail_keys = list(dict.fromkeys([*file_keys, *(row.output_key for row in thumbnail_rows if row.output_key)]))
             for row in thumbnail_rows:
                 # 删除操作进入 durable prepared 后，任何旧缩略图都必须立即失效；
                 # output_key 保留到事务完成后供清理器回收物理文件。
@@ -860,10 +845,9 @@ class StorageCoordinator:
             record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == UUID(str(meme_id))).with_for_update())
             if operation is None or record is None:
                 raise DatabaseError("storage_operation_missing")
-            # 生成 Worker 可能在第一次收集后完成输出；同一父行锁保证它不能在
-            # 这里提交之后继续写入，最终收集覆盖该窗口内的全部派生 key。
+            # 共享图片锁覆盖文件操作，最终事务仍核对数据库派生记录。
             thumbnail_rows = self._thumbnail_rows(session, record.id)
-            thumbnail_keys = list(dict.fromkeys([*self._thumbnail_keys_for_record(session, record, rows=thumbnail_rows), *self._thumbnail_keys(operation)]))
+            thumbnail_keys = list(dict.fromkeys([*(row.output_key for row in thumbnail_rows if row.output_key), *self._thumbnail_keys(operation)]))
             operation.thumbnail_keys = thumbnail_keys
             for row in thumbnail_rows:
                 row.status = "stale"
@@ -945,37 +929,119 @@ class StorageCoordinator:
             raise DatabaseError("storage_cleanup_pending")
 
     def recover(self, *, limit: int = 100) -> dict[str, int]:
-        """以 SKIP LOCKED 独占恢复未完成操作，并返回各状态处理计数。"""
+        """逐项在图片身份锁内恢复操作，每项文件处理之前归还查询连接。"""
         counts = {"completed": 0, "compensated": 0, "blocked": 0, "retried": 0}
         with self.resources.factory() as session:
-            rows = list(session.scalars(select(StorageOperation).where(StorageOperation.scope_id == self.scope.scope_id, StorageOperation.status.in_(tuple(self._ACTIVE))).order_by(StorageOperation.updated_at).with_for_update(skip_locked=True).limit(max(1, min(limit, 1000)))))
-            for operation in rows:
-                self._session = session
-                try:
-                    if operation.operation_type == "upload":
-                        self._recover_upload(session, operation, counts)
-                    elif operation.operation_type == "rename":
-                        self._recover_rename(session, operation, counts)
-                    elif operation.operation_type == "delete":
-                        self._recover_delete(session, operation, counts)
-                    else:
-                        # 数据库 CHECK 已禁止新值，但旧安装或人工修复可能留下
-                        # 未知类型；恢复器必须停在 blocked，不能静默丢掉副作用事实。
-                        self._set_status(operation, "blocked", error={"error": "storage_operation_unknown_type"}, session=session)
-                        counts["blocked"] += 1
-                except DatabaseError as exc:
-                    diagnostic = {"error": exc.code, "message": str(exc)}
-                    # 删除 operation 可能已经解除 Meme 外键；恢复失败时仍保留
-                    # 身份 marker，方便下一次人工/离线恢复定位同源派生输出。
-                    if isinstance(operation.error, dict):
-                        for key in ("meme_id", "source_sha256", "source_size_bytes"):
-                            if key in operation.error:
-                                diagnostic[key] = operation.error[key]
-                    self._set_status(operation, "blocked", error=diagnostic, session=session)
-                    counts["blocked"] += 1
-            session.commit()
-            self._session = None
+            rows = list(session.scalars(select(StorageOperation).where(StorageOperation.scope_id == self.scope.scope_id, StorageOperation.status.in_(tuple(self._ACTIVE))).order_by(StorageOperation.updated_at).limit(max(1, min(limit, 1000)))))
+        for snapshot in rows:
+            digest = snapshot.after_sha256 if snapshot.operation_type == "upload" else snapshot.before_sha256
+            key = snapshot.target_key if snapshot.operation_type == "upload" else snapshot.source_key
+            with self.blob_store.identity_lock(digest, Path(key).suffix):
+                with self.resources.factory() as session:
+                    operation = session.get(StorageOperation, snapshot.id)
+                    if operation is None or operation.status not in self._ACTIVE:
+                        continue
+                    # 记录保持已加载状态，后续文件操作不会触发隐式查询。
+                    session.expunge(operation)
+                if operation.operation_type in {"upload", "delete"}:
+                    self._recover_file_operation(operation, counts)
+                    continue
+                with self._transaction() as session:
+                    operation = session.get(StorageOperation, snapshot.id, with_for_update=True)
+                    if operation is None or operation.status not in self._ACTIVE:
+                        continue
+                    self._recover_rename(session, operation, counts)
         return counts
+
+    def _recover_file_operation(self, snapshot: StorageOperation, counts: dict[str, int]) -> None:
+        """在共享锁内处理上传或删除文件，再以短事务核对 operation 并提交状态。"""
+        try:
+            if snapshot.operation_type == "upload":
+                target_ok = self.blob_store.exists_with_identity(snapshot.target_key, sha256=snapshot.after_sha256, size_bytes=snapshot.after_size)
+                stage_ok = self.blob_store.exists_with_identity(snapshot.staging_key, sha256=snapshot.after_sha256, size_bytes=snapshot.after_size)
+                if snapshot.status == "prepared" and stage_ok and not target_ok:
+                    self.blob_store.link_move(snapshot.staging_key, snapshot.target_key)
+                    target_ok, stage_ok = True, False
+                    counts["retried"] += 1
+                if stage_ok:
+                    raise DatabaseError("upload_recovery_ambiguous")
+                with self._transaction() as session:
+                    operation = self._recovery_current(session, snapshot)
+                    if target_ok:
+                        self._set_status(operation, "file_applied", session=session)
+                        self._set_status(operation, "completed", session=session)
+                        counts["completed"] += 1
+                    else:
+                        record = session.get(Meme, operation.meme_id) if operation.meme_id else None
+                        if record is not None:
+                            if (record.sha256, record.size_bytes, record.storage_key) != (snapshot.after_sha256, snapshot.after_size, snapshot.target_key):
+                                raise DatabaseError("upload_target_changed")
+                            operation.meme_id = None
+                            session.delete(record)
+                        self._set_status(operation, "compensated", session=session)
+                        counts["compensated"] += 1
+                return
+            identity = self._delete_identity(snapshot)
+            identifier = identity[0] if identity is not None else snapshot.meme_id
+            if identity is not None and (identity[1], identity[2]) != (snapshot.before_sha256, snapshot.before_size):
+                raise DatabaseError("delete_identity_mismatch")
+            keys = self._thumbnail_keys(snapshot)
+            if identifier is not None:
+                keys.extend(self._thumbnail_file_keys(identifier, snapshot.before_sha256))
+            source_ok = self.blob_store.exists_with_identity(snapshot.source_key, sha256=snapshot.before_sha256, size_bytes=snapshot.before_size)
+            quarantine_ok = self.blob_store.exists_with_identity(snapshot.target_key, sha256=snapshot.before_sha256, size_bytes=snapshot.before_size)
+            if snapshot.status == "prepared" and source_ok and not quarantine_ok:
+                self.blob_store.quarantine(snapshot.source_key, token=snapshot.operation_token)
+                source_ok, quarantine_ok = False, True
+                counts["retried"] += 1
+            if source_ok or (snapshot.status == "prepared" and not quarantine_ok):
+                raise DatabaseError("delete_recovery_ambiguous")
+            with self._transaction() as session:
+                operation = self._recovery_current(session, snapshot)
+                record = session.get(Meme, identifier, with_for_update=True) if identifier else None
+                if record is not None:
+                    if snapshot.meme_id is None or (record.sha256, record.size_bytes, record.storage_key) != (snapshot.before_sha256, snapshot.before_size, snapshot.source_key):
+                        raise DatabaseError("delete_target_changed")
+                    keys.extend(row.output_key for row in self._thumbnail_rows(session, record.id) if row.output_key)
+                    operation.meme_id = None
+                    session.delete(record)
+                self._set_status(operation, "file_applied", session=session)
+                operation.error = self._delete_identity_marker(*identity) if identity else snapshot.error
+                operation.thumbnail_keys = list(dict.fromkeys(keys))
+                session.flush()
+            if quarantine_ok:
+                self.blob_store.unlink(snapshot.target_key)
+            elif self._path_present(self.blob_store, snapshot.target_key):
+                raise DatabaseError("delete_blob_identity_mismatch")
+            remaining = self._cleanup_thumbnail_files(keys)
+            with self._transaction() as session:
+                operation = session.get(StorageOperation, snapshot.id, with_for_update=True)
+                if operation is None or operation.status != "file_applied":
+                    raise DatabaseError("storage_operation_changed")
+                operation.thumbnail_keys = remaining
+                if remaining:
+                    operation.error = self._merge_delete_error(self._delete_identity_marker(*identity) if identity else None, error="storage_cleanup_pending", thumbnail_count=len(remaining))
+                    counts["retried"] += 1
+                else:
+                    self._set_status(operation, "completed", session=session)
+                    counts["completed"] += 1
+        except DatabaseError as exc:
+            with self._transaction() as session:
+                operation = session.get(StorageOperation, snapshot.id, with_for_update=True)
+                if operation is None or operation.status not in self._ACTIVE:
+                    raise
+                self._session = session
+                diagnostic = dict(operation.error or {})
+                diagnostic.update(error=exc.code, message=str(exc))
+                self._set_status(operation, "blocked", error=diagnostic, session=session)
+                counts["blocked"] += 1
+
+    def _recovery_current(self, session: Session, snapshot: StorageOperation) -> StorageOperation:
+        """在文件处理后锁定并复核操作版本，拒绝使用已经变化的恢复输入。"""
+        operation = session.get(StorageOperation, snapshot.id, with_for_update=True)
+        if operation is None or operation.status != snapshot.status or operation.updated_at != snapshot.updated_at:
+            raise DatabaseError("storage_operation_changed")
+        return operation
 
     def _recover_upload(self, session: Session, operation: StorageOperation, counts: dict[str, int]) -> None:
         """恢复上传暂存文件或补偿无文件的 Meme。"""

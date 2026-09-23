@@ -215,20 +215,21 @@ class PostgresMetadataService:
                 raise MetadataError("metadata_invalid") from exc
             if record.extension != extension or record.storage_key != expected_key:
                 raise MetadataError("metadata_image_mismatch")
-            try:
-                image = self.blob_store.resolve(record.storage_key)
-            except DatabaseError as exc:
-                raise MetadataError(exc.code) from exc
-            if image.name != expected_key or image.suffix != extension:
-                raise MetadataError("metadata_image_mismatch")
-            identity = self._identity(image)
-            if (
-                identity["extension"] != extension
-                or record.sha256 != identity["sha256"]
-                or record.size_bytes != identity["size_bytes"]
-            ):
-                raise MetadataError("metadata_image_mismatch")
-            return record, image
+        # 返回的记录已经结束事务；文件读取期间无需保留数据库连接。
+        try:
+            image = self.blob_store.resolve(record.storage_key)
+        except DatabaseError as exc:
+            raise MetadataError(exc.code) from exc
+        if image.name != expected_key or image.suffix != extension:
+            raise MetadataError("metadata_image_mismatch")
+        identity = self._identity(image)
+        if (
+            identity["extension"] != extension
+            or record.sha256 != identity["sha256"]
+            or record.size_bytes != identity["size_bytes"]
+        ):
+            raise MetadataError("metadata_image_mismatch")
+        return record, image
 
     def find_existing_upload(
         self,

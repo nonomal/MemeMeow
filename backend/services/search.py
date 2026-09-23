@@ -191,17 +191,18 @@ class PostgresSearchService:
         vector = self._embedding(query)
         with self.resources.environment(self.scope.scope_id) as environment:
             ranked = environment.search.query(self.model, vector, top_k)
-            result: list[tuple[str, float]] = []
-            seen: set[str] = set()
-            for meme_id, score in ranked:
-                try:
-                    _record, image = self.metadata.image_for_meme(meme_id)
-                except MetadataError:
-                    continue
-                value = str(meme_id)
-                if value not in seen:
-                    seen.add(value)
-                    result.append((value, float(score)))
-                if len(result) >= top_k:
-                    break
-            return result
+        # 图片校验会读取文件并查询当前记录，查询事务应在进入校验前释放连接。
+        result: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        for meme_id, score in ranked:
+            try:
+                _record, image = self.metadata.image_for_meme(meme_id)
+            except MetadataError:
+                continue
+            value = str(meme_id)
+            if value not in seen:
+                seen.add(value)
+                result.append((value, float(score)))
+            if len(result) >= top_k:
+                break
+        return result
