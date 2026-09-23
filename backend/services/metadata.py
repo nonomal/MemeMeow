@@ -411,6 +411,28 @@ class PostgresMetadataService:
             record.updated_at = utcnow()
             environment.uow.session.flush()
 
+    def update_display_name(
+        self, meme_id: UUID | str, display_name: str, *,
+        expected_display_name: str | None = None, expected_revision: int | None = None,
+        expected_sha256: str | None = None, claim: tuple[str, int, str] | None = None,
+    ) -> SidecarMetadata:
+        """在事务外校验图片，再按当前身份和可选 Task 条件更新展示名称。"""
+        snapshot, _image = self.image_for_meme(meme_id)
+        with self.resources.environment(self.scope) as environment:
+            record = environment.memes.get(meme_id, for_update=True)
+            if record is None:
+                raise MetadataError("meme_not_found")
+            if (record.storage_key, record.sha256, record.size_bytes) != (snapshot.storage_key, snapshot.sha256, snapshot.size_bytes):
+                raise MetadataError("target_changed")
+            try:
+                record = environment.memes.update_display_name(
+                    meme_id, display_name, expected_display_name=expected_display_name,
+                    expected_revision=expected_revision, expected_sha256=expected_sha256, claim=claim,
+                )
+            except DatabaseError as exc:
+                raise MetadataError(exc.code) from exc
+            return self._to_sidecar(record)
+
     def rename(self, source: Path, target: Path) -> SidecarMetadata:
         """按稳定 Meme 身份更新展示名称，不改变内容寻址物理 key。"""
         source_key = self._relative(source)

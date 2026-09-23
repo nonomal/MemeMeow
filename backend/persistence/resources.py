@@ -145,7 +145,8 @@ class DatabaseResources:
             scope = owned_session.scalar(select(Scope).where(Scope.id == scope_id))
             if scope is None:
                 raise DatabaseError("scope_not_found")
-            return BlobStore(root=self.data_root, scope=ScopeContext(scope_id), storage_namespace=scope.storage_namespace, local=False)
+            namespace = scope.storage_namespace
+        return BlobStore(root=self.data_root, scope=ScopeContext(scope_id), storage_namespace=namespace, local=False)
 
     def thumbnail_store_for_scope(self, scope_id: str | ScopeContext) -> BlobStore:
         """创建与原图物理隔离、但使用同一 scope namespace 的派生存储。"""
@@ -158,4 +159,5 @@ class DatabaseResources:
             scope = session.scalar(select(Scope).where(Scope.id == context.scope_id))
             if scope is None:
                 raise DatabaseError("scope_not_found")
-            return BlobStore(root=self.derived_thumbnail_root, scope=context, storage_namespace=scope.storage_namespace, local=False)
+            namespace = scope.storage_namespace
+        return BlobStore(root=self.derived_thumbnail_root, scope=context, storage_namespace=namespace, local=False)
