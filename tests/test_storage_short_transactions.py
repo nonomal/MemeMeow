@@ -15,11 +15,13 @@ from PIL import Image
 from sqlalchemy import delete, select
 
 from backend.persistence.engine import create_engine_for_url
+from backend.persistence.engine import DatabaseError
 from backend.persistence.file_lock import shared_file_lock
 from backend.persistence.models import Meme, Scope, StorageOperation
 from backend.persistence.resources import DatabaseResources
 from backend.persistence.storage import StorageCoordinator
 from backend.services.metadata import PostgresMetadataService
+from backend.metadata import MetadataError
 from backend.services.thumbnails import DerivedThumbnailService
 
 
@@ -220,3 +222,231 @@ def test_multiprocess_generation_and_deletion(storage_case):
     with resources.environment(scope) as environment:
         assert environment.memes.get(record.id) is None
     assert storage._thumbnail_file_keys(record.id, record.sha256) == []
+
+
+@pytest.mark.parametrize("reupload", [False, True])
+def test_context_update_rejects_deleted_identity(storage_case, reupload):
+    """校验文件后发生删除或重新上传时，旧更新必须拒绝写入且不得创建记录。"""
+    resources, scope, content, _, _ = storage_case
+    storage = StorageCoordinator(resources, scope_id=scope)
+    record = storage.upload(content, extension=".png", context={}, provenance={})
+    metadata = PostgresMetadataService(resources, scope_id=scope)
+    path = storage.blob_store.resolve(record.storage_key)
+    replacement = []
+
+    def delete_after_read(frame, event, argument):
+        """在真实身份读取返回时完成删除，精确覆盖写回之前的并发窗口。"""
+        if event == "return" and frame.f_code is PostgresMetadataService._identity.__code__:
+            sys.setprofile(None)
+            assert resources.engine.pool.checkedout() == 0
+            storage.delete(record.id)
+            if reupload:
+                replacement.append(storage.upload(content, extension=".png", context={}, provenance={}))
+
+    sys.setprofile(delete_after_read)
+    try:
+        with pytest.raises(MetadataError, match="metadata_missing"):
+            metadata.update_context(path, {"title": "过期结果"}, producer="test")
+    finally:
+        sys.setprofile(None)
+    with resources.environment(scope) as environment:
+        assert environment.memes.get(record.id) is None
+        current = environment.memes.by_storage_key(record.storage_key)
+        if reupload:
+            assert current.id == replacement[0].id
+            assert current.meme_context.get("title") != "过期结果"
+        else:
+            assert current is None
+
+
+def test_pending_registration_and_context_update(storage_case):
+    """已有图片登记与元数据更新保持可用，文件读取和锁等待均在事务外。"""
+    resources, scope, content, _, _ = storage_case
+    storage = StorageCoordinator(resources, scope_id=scope)
+    key = hashlib.sha256(content).hexdigest() + ".png"
+    stage = storage.blob_store.stage_bytes(content, token=uuid4())
+    storage.blob_store.link_move(stage, key)
+    metadata = PostgresMetadataService(resources, scope_id=scope)
+    path = storage.blob_store.resolve(key)
+    observed = []
+
+    def observe(frame, event, argument):
+        """核对真实登记及更新调用中的文件读取和文件锁连接占用。"""
+        if event == "call" and frame.f_code.co_name in {"_identity", "shared_file_lock"}:
+            observed.append(resources.engine.pool.checkedout())
+
+    sys.setprofile(observe)
+    try:
+        metadata.create_pending(path)
+        metadata.create_pending(path)
+        result = metadata.update_context(path, {"title": "已登记图片"}, producer="test")
+    finally:
+        sys.setprofile(None)
+    assert result.meme_context.title == "已登记图片"
+    assert observed and all(value == 0 for value in observed)
+
+
+def test_scans_release_connections(storage_case):
+    """预检与完整性扫描在文件读取和目录遍历期间归还连接，缺失记录仍能标记。"""
+    resources, scope, content, _, _ = storage_case
+    storage = StorageCoordinator(resources, scope_id=scope)
+    record = storage.upload(content, extension=".png", context={}, provenance={})
+    observed = []
+
+    def observe(frame, event, argument):
+        """观察真实扫描入口，不替换文件或数据库操作。"""
+        if event == "call" and frame.f_code.co_name in {"exists_with_identity", "rglob", "shared_file_lock"}:
+            observed.append(resources.engine.pool.checkedout())
+
+    sys.setprofile(observe)
+    try:
+        assert storage.flat_preflight()["missing_files"] == []
+        assert storage.integrity_scan()["missing_files"] == []
+        storage.blob_store.unlink(record.storage_key)
+        assert storage.flat_preflight()["missing_files"] == [str(record.id)]
+        assert storage.integrity_scan()["missing_files"] == [str(record.id)]
+    finally:
+        sys.setprofile(None)
+    assert observed and all(value == 0 for value in observed)
+    with resources.environment(scope) as environment:
+        assert environment.memes.get(record.id).context_status == "repair_required"
+
+
+def test_scan_rejects_changed_snapshot(storage_case):
+    """扫描检查期间的元数据更新使旧快照失效，不得覆盖最新状态。"""
+    resources, scope, content, _, _ = storage_case
+    storage = StorageCoordinator(resources, scope_id=scope)
+    record = storage.upload(content, extension=".png", context={}, provenance={})
+    storage.blob_store.unlink(record.storage_key)
+
+    def update_during_scan(frame, event, argument):
+        """在真实文件检查返回后更新记录，检验写回版本检查。"""
+        if event == "return" and frame.f_code.co_name == "exists_with_identity":
+            sys.setprofile(None)
+            with resources.environment(scope) as environment:
+                environment.memes.update_display_name(record.id, "changed-during-scan")
+
+    sys.setprofile(update_during_scan)
+    try:
+        with pytest.raises(DatabaseError, match="storage_scan_target_changed"):
+            storage.integrity_scan()
+    finally:
+        sys.setprofile(None)
+    with resources.environment(scope) as environment:
+        assert environment.memes.get(record.id).context_status != "repair_required"
+
+
+def _move_until_link(url, root, scope, source, target, ready):
+    """子进程执行真实移动，在 os.link 返回后等待父进程终止。"""
+    engine = create_engine_for_url(url, pool_size=1, max_overflow=0, pool_timeout=2)
+    try:
+        resources = DatabaseResources(engine, image_root=root / "images", data_root=root / "data", require_local_scope=False)
+        storage = StorageCoordinator(resources, scope_id=scope)
+
+        def pause_after_link(frame, event, argument):
+            """保留真实 link 的中间状态，供父进程验证中断恢复。"""
+            if event == "c_return" and argument is os.link:
+                ready.send(True)
+                ready.recv()
+
+        sys.setprofile(pause_after_link)
+        storage.blob_store.link_move(source, target)
+    finally:
+        sys.setprofile(None)
+        engine.dispose()
+
+
+@pytest.mark.parametrize("operation_type", ["upload", "delete"])
+def test_recover_process_terminated_after_link(storage_case, operation_type):
+    """真实移动进程在 link 后终止，恢复器完成上传或删除且清理源链接。"""
+    resources, scope, content, url, root = storage_case
+    storage = StorageCoordinator(resources, scope_id=scope)
+    token = uuid4()
+    digest = hashlib.sha256(content).hexdigest()
+    key = digest + ".png"
+    if operation_type == "upload":
+        source = storage.blob_store.stage_bytes(content, token=token)
+        target = key
+        with resources.environment(scope) as environment:
+            record = environment.memes.create(storage_key=key, extension=".png", size_bytes=len(content), sha256=digest, context={}, provenance={}, status="pending")
+            environment.uow.session.add(StorageOperation(scope_id=scope, meme_id=record.id, operation_type="upload", operation_token=token, target_key=target, staging_key=source, after_sha256=digest, after_size=len(content), status="prepared"))
+    else:
+        record = storage.upload(content, extension=".png", context={}, provenance={})
+        source, target = key, f".quarantine/{token.hex}.blob"
+        with resources.environment(scope) as environment:
+            environment.uow.session.add(StorageOperation(scope_id=scope, meme_id=record.id, operation_type="delete", operation_token=token, source_key=source, target_key=target, before_sha256=digest, before_size=len(content), status="prepared", error=storage._delete_identity_marker(record.id, digest, len(content))))
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_move_until_link, args=(url, root, scope, source, target, child))
+    process.start()
+    try:
+        assert parent.poll(20) and parent.recv()
+    finally:
+        process.terminate()
+        process.join(10)
+        parent.close()
+        child.close()
+    assert process.exitcode is not None
+    assert storage.blob_store._key_path(source).samefile(storage.blob_store._key_path(target))
+    assert storage.recover()["completed"] == 1
+    assert not storage.blob_store.exists_with_identity(source)
+    with resources.environment(scope) as environment:
+        assert (environment.memes.get(record.id) is not None) == (operation_type == "upload")
+    assert storage.blob_store.exists_with_identity(target) == (operation_type == "upload")
+
+
+@pytest.mark.parametrize("operation_type", ["upload", "delete"])
+def test_recovery_preserves_distinct_files(storage_case, operation_type):
+    """内容相同但 inode 不同的两个文件保持不变，恢复记录明确报告歧义。"""
+    resources, scope, content, _, _ = storage_case
+    storage = StorageCoordinator(resources, scope_id=scope)
+    record = storage.upload(content, extension=".png", context={}, provenance={})
+    token = uuid4()
+    staged = storage.blob_store.stage_bytes(content, token=token)
+    if operation_type == "upload":
+        source, target = staged, record.storage_key
+        operation = StorageOperation(scope_id=scope, meme_id=record.id, operation_type="upload", operation_token=token, staging_key=source, target_key=target, after_sha256=record.sha256, after_size=record.size_bytes, status="prepared")
+    else:
+        source, target = record.storage_key, f".quarantine/{token.hex}.blob"
+        storage.blob_store.link_move(staged, target)
+        operation = StorageOperation(scope_id=scope, meme_id=record.id, operation_type="delete", operation_token=token, source_key=source, target_key=target, before_sha256=record.sha256, before_size=record.size_bytes, status="prepared", error=storage._delete_identity_marker(record.id, record.sha256, record.size_bytes))
+    with resources.environment(scope) as environment:
+        environment.uow.session.add(operation)
+    assert not storage.blob_store._key_path(source).samefile(storage.blob_store._key_path(target))
+    assert storage.recover()["blocked"] == 1
+    assert storage.blob_store._key_path(source).read_bytes() == content
+    assert storage.blob_store._key_path(target).read_bytes() == content
+    with resources.environment(scope) as environment:
+        current = environment.uow.session.get(StorageOperation, operation.id)
+        assert current.error["error"] == f"{operation_type}_recovery_ambiguous"
+
+
+@pytest.mark.skipif(not hasattr(StorageCoordinator, "_recover_rename"), reason="当前版本不支持历史 rename operation")
+def test_legacy_rename_recovery_releases_connection(storage_case):
+    """历史重命名已经提交记录时，恢复文件移动并保留原有 revision。"""
+    resources, scope, content, _, _ = storage_case
+    storage = StorageCoordinator(resources, scope_id=scope)
+    record = storage.upload(content, extension=".png", context={}, provenance={})
+    source = "legacy-image.png"
+    storage.blob_store.link_move(record.storage_key, source)
+    with resources.environment(scope) as environment:
+        current = environment.memes.get(record.id, for_update=True)
+        current.revision = 2
+        environment.uow.session.add(StorageOperation(scope_id=scope, meme_id=record.id, operation_type="rename", operation_token=uuid4(), source_key=source, target_key=record.storage_key, before_sha256=record.sha256, after_sha256=record.sha256, before_size=record.size_bytes, after_size=record.size_bytes, expected_revision=1, status="prepared"))
+    observed = []
+
+    def observe(frame, event, argument):
+        """观察历史恢复中的真实文件操作连接占用。"""
+        if event == "call" and frame.f_code.co_name in {"exists_with_identity", "link_move", "finish_link_move"}:
+            observed.append(resources.engine.pool.checkedout())
+
+    sys.setprofile(observe)
+    try:
+        assert storage.recover()["completed"] == 1
+    finally:
+        sys.setprofile(None)
+    assert observed and all(value == 0 for value in observed)
+    assert storage.blob_store.resolve(record.storage_key).read_bytes() == content
+    assert not storage.blob_store.exists_with_identity(source)
+    with resources.environment(scope) as environment:
+        assert environment.memes.get(record.id).revision == 2

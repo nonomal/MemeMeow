@@ -164,11 +164,7 @@ class BlobStore:
         except FileExistsError as exc:
             raise DatabaseError("target_exists") from exc
         except OSError as exc:
-            try:
-                if target.exists() and not source.exists():
-                    os.unlink(target)
-            except OSError:
-                pass
+            # 已创建的目标由 durable operation 恢复，错误处理必须保留现有文件。
             raise DatabaseError("file_move_failed") from exc
 
     def quarantine(self, source_key: str, *, token: UUID) -> str:
@@ -176,6 +172,19 @@ class BlobStore:
         target_key = f".quarantine/{token.hex}.blob"
         self.link_move(source_key, target_key)
         return target_key
+
+    def finish_link_move(self, source_key: str, target_key: str) -> bool:
+        """恢复 link 已完成的移动；只有两个受控路径指向同一 inode 才删除源路径。"""
+        source = self._key_path(source_key, must_exist=True)
+        target = self._key_path(target_key, must_exist=True)
+        try:
+            if source == target or not source.samefile(target):
+                return False
+            self.unlink(source_key)
+            self._fsync_directory(target.parent)
+            return True
+        except OSError as exc:
+            raise DatabaseError("file_move_failed") from exc
 
     def unlink(self, key: str) -> None:
         """只删除受控普通文件，拒绝符号链接和越界路径。"""
@@ -954,11 +963,10 @@ class StorageCoordinator:
                 if operation.operation_type in {"upload", "delete"}:
                     self._recover_file_operation(operation, counts)
                     continue
-                with self._transaction() as session:
-                    operation = session.get(StorageOperation, snapshot.id, with_for_update=True)
-                    if operation is None or operation.status not in self._ACTIVE:
-                        continue
-                    self._recover_rename(session, operation, counts)
+                try:
+                    self._recover_rename(operation, counts)
+                except DatabaseError as exc:
+                    self._record_recovery_error(operation, counts, exc)
         return counts
 
     def _recover_file_operation(self, snapshot: StorageOperation, counts: dict[str, int]) -> None:
@@ -975,6 +983,9 @@ class StorageCoordinator:
                 stage_ok = self.blob_store.exists_with_identity(snapshot.staging_key, sha256=snapshot.after_sha256, size_bytes=snapshot.after_size)
                 if (not target_ok and self._path_present(self.blob_store, snapshot.target_key)) or (not stage_ok and self._path_present(self.blob_store, snapshot.staging_key)):
                     raise DatabaseError("upload_blob_identity_mismatch")
+                if target_ok and stage_ok and self.blob_store.finish_link_move(snapshot.staging_key, snapshot.target_key):
+                    stage_ok = False
+                    counts["retried"] += 1
                 if snapshot.status == "prepared" and stage_ok and not target_ok:
                     self.blob_store.link_move(snapshot.staging_key, snapshot.target_key)
                     target_ok, stage_ok = True, False
@@ -1008,6 +1019,9 @@ class StorageCoordinator:
                 keys.extend(self._thumbnail_file_keys(identifier, snapshot.before_sha256))
             source_ok = self.blob_store.exists_with_identity(snapshot.source_key, sha256=snapshot.before_sha256, size_bytes=snapshot.before_size)
             quarantine_ok = self.blob_store.exists_with_identity(snapshot.target_key, sha256=snapshot.before_sha256, size_bytes=snapshot.before_size)
+            if source_ok and quarantine_ok and self.blob_store.finish_link_move(snapshot.source_key, snapshot.target_key):
+                source_ok = False
+                counts["retried"] += 1
             if snapshot.status == "prepared" and source_ok and not quarantine_ok:
                 self.blob_store.quarantine(snapshot.source_key, token=snapshot.operation_token)
                 source_ok, quarantine_ok = False, True
@@ -1046,19 +1060,23 @@ class StorageCoordinator:
                     self._set_status(operation, "completed", session=session)
                     counts["completed"] += 1
         except DatabaseError as exc:
-            with self._transaction() as session:
-                operation = session.get(StorageOperation, snapshot.id, with_for_update=True)
-                if operation is None or operation.status not in self._ACTIVE:
-                    raise
-                self._session = session
-                diagnostic = dict(operation.error or {})
-                diagnostic.update(error=exc.code, message=str(exc))
-                if exc.code in {"thumbnail_storage_unavailable", "file_delete_failed", "file_move_failed"}:
-                    operation.error = diagnostic
-                    counts["retried"] += 1
-                else:
-                    self._set_status(operation, "blocked", error=diagnostic, session=session)
-                    counts["blocked"] += 1
+            self._record_recovery_error(snapshot, counts, exc)
+
+    def _record_recovery_error(self, snapshot: StorageOperation, counts: dict[str, int], error: DatabaseError) -> None:
+        """保存恢复错误的具体原因，文件系统暂时错误保留可重试状态。"""
+        with self._transaction() as session:
+            operation = session.get(StorageOperation, snapshot.id, with_for_update=True)
+            if operation is None or operation.status not in self._ACTIVE:
+                raise error
+            diagnostic = dict(operation.error or {})
+            diagnostic.update(error=error.code, message=str(error))
+            if error.code in {"thumbnail_storage_unavailable", "file_delete_failed", "file_move_failed"}:
+                operation.error = diagnostic
+                operation.updated_at = utcnow()
+                counts["retried"] += 1
+            else:
+                self._set_status(operation, "blocked", error=diagnostic, session=session)
+                counts["blocked"] += 1
 
     def _recovery_current(self, session: Session, snapshot: StorageOperation) -> StorageOperation:
         """在文件处理后锁定并复核操作版本，拒绝使用已经变化的恢复输入。"""
@@ -1090,11 +1108,8 @@ class StorageCoordinator:
         else:
             raise DatabaseError("upload_recovery_ambiguous")
 
-    def _recover_rename(self, session: Session, operation: StorageOperation, counts: dict[str, int]) -> None:
-        """恢复重命名文件动作和数据库路径提交。"""
-        assert operation.source_key and operation.target_key
-        source_ok = self.blob_store.exists_with_identity(operation.source_key, sha256=operation.before_sha256, size_bytes=operation.before_size)
-        target_ok = self.blob_store.exists_with_identity(operation.target_key, sha256=operation.after_sha256, size_bytes=operation.after_size)
+    def _rename_recovery_record(self, session: Session, operation: StorageOperation) -> tuple[Meme, bool, bool]:
+        """复核历史重命名的任务及记录版本，返回源绑定与已提交状态。"""
         record = session.scalar(select(Meme).where(Meme.scope_id == self.scope.scope_id, Meme.id == operation.meme_id).with_for_update())
         if record is None:
             raise DatabaseError("meme_not_found")
@@ -1138,39 +1153,39 @@ class StorageCoordinator:
             record.storage_key == operation.source_key
             and (operation.expected_revision is None or record.revision == operation.expected_revision)
         )
-        if operation.status == "prepared":
-            if not same_image or not title_matches:
-                raise DatabaseError("rename_target_changed")
-            if not source_binding and not already_finalized:
-                # 文件动作尚未被本 operation 可靠确认，同图手动改名已经替换了
-                # source key 时可以补偿操作；其它组合必须停在 blocked。
+        if not same_image or not title_matches:
+            raise DatabaseError("rename_target_changed")
+        return record, source_binding, already_finalized
+
+    def _recover_rename(self, snapshot: StorageOperation, counts: dict[str, int]) -> None:
+        """在事务外恢复历史文件移动，前后短事务均复核任务与记录版本。"""
+        assert snapshot.source_key and snapshot.target_key
+        source_ok = self.blob_store.exists_with_identity(snapshot.source_key, sha256=snapshot.before_sha256, size_bytes=snapshot.before_size)
+        target_ok = self.blob_store.exists_with_identity(snapshot.target_key, sha256=snapshot.after_sha256, size_bytes=snapshot.after_size)
+        with self._transaction() as session:
+            operation = self._recovery_current(session, snapshot)
+            _record, source_binding, already_finalized = self._rename_recovery_record(session, operation)
+            if operation.status == "prepared" and not source_binding and not already_finalized:
                 if not source_ok and not target_ok:
                     self._set_status(operation, "compensated", error={"error": "storage_key_changed"}, session=session)
                     counts["compensated"] += 1
                     return
                 raise DatabaseError("rename_target_changed")
-        if operation.status == "prepared" and source_ok and not target_ok:
-            self.blob_store.link_move(operation.source_key, operation.target_key)
+        if source_ok and target_ok and self.blob_store.finish_link_move(snapshot.source_key, snapshot.target_key):
+            source_ok = False
+            counts["retried"] += 1
+        if snapshot.status == "prepared" and source_ok and not target_ok:
+            self.blob_store.link_move(snapshot.source_key, snapshot.target_key)
             source_ok, target_ok = False, True
             counts["retried"] += 1
-        if target_ok and not source_ok:
-            # 只有数据库仍保留 operation 记录的 CAS 输入时才能补交 Meme；若
-            # finalize 已经成功但连接在提交后断开，则识别已完成事实而不重复递增
-            # revision；人工改名或 SHA 变化必须阻断，不能覆盖用户结果。
-            if (
-                record.storage_key == operation.target_key
-                and operation.expected_revision is not None
-                and record.revision == operation.expected_revision + 1
-                and same_image
-                and title_matches
-            ):
+        if not target_ok or source_ok:
+            raise DatabaseError("rename_recovery_ambiguous")
+        with self._transaction() as session:
+            operation = self._recovery_current(session, snapshot)
+            record, source_binding, already_finalized = self._rename_recovery_record(session, operation)
+            if already_finalized:
                 self._set_status(operation, "file_applied", session=session)
-            elif (
-                record.storage_key == operation.source_key
-                and (operation.expected_revision is None or record.revision == operation.expected_revision)
-                and same_image
-                and title_matches
-            ):
+            elif source_binding:
                 self._set_status(operation, "file_applied", session=session)
                 record.storage_key = operation.target_key
                 record.revision += 1
@@ -1179,12 +1194,6 @@ class StorageCoordinator:
                 raise DatabaseError("rename_target_changed")
             self._set_status(operation, "completed", session=session)
             counts["completed"] += 1
-        elif source_ok and not target_ok and operation.status == "file_applied":
-            # ``file_applied`` 已经声明发生过文件副作用；源文件重新出现且目标
-            # 消失无法证明是回滚还是外部修改，不能把这条事实静默标成 compensated。
-            raise DatabaseError("rename_recovery_ambiguous")
-        else:
-            raise DatabaseError("rename_recovery_ambiguous")
 
     def _recover_delete(self, session: Session, operation: StorageOperation, counts: dict[str, int]) -> None:
         """恢复原图隔离和派生清理；冲突时阻断自动修改。"""
@@ -1379,6 +1388,13 @@ class StorageCoordinator:
         self._set_status(operation, "completed", session=session)
         counts["completed"] += 1
 
+    def _scan_snapshot(self) -> tuple[list[Meme], list[StorageOperation]]:
+        """读取当前 scope 的扫描快照并归还连接，供事务外目录与文件检查使用。"""
+        with self.resources.factory() as session:
+            records = list(session.scalars(select(Meme).where(Meme.scope_id == self.scope.scope_id)))
+            operations = list(session.scalars(select(StorageOperation).where(StorageOperation.scope_id == self.scope.scope_id, StorageOperation.status.in_(tuple(self._ACTIVE)))))
+        return records, operations
+
     def flat_preflight(self) -> dict[str, Any]:
         """只读检查业务身份、嵌套图片和记录/文件一致性，供 migration 与启动门禁使用。
 
@@ -1398,111 +1414,105 @@ class StorageCoordinator:
             "mismatched": [],
             "active_operations": [],
         }
-        with self.resources.factory() as session:
-            records = list(session.scalars(select(Meme).where(Meme.scope_id == self.scope.scope_id)))
-            referenced: set[str] = set()
-            content_records: dict[tuple[str, str], str] = {}
-            for record in records:
-                storage_key = record.storage_key if isinstance(record.storage_key, str) else ""
-                if storage_key:
-                    referenced.add(storage_key)
-                record_id = str(record.id)
-                sha256 = record.sha256 if isinstance(record.sha256, str) else ""
-                extension = record.extension if isinstance(record.extension, str) else ""
-                sha_valid = re.fullmatch(r"[0-9a-f]{64}", sha256) is not None
-                extension_valid = extension in SUPPORTED_EXTENSIONS and extension == extension.lower()
-                if not sha_valid:
-                    report["invalid_sha256"].append(record_id)
-                if not extension_valid:
-                    report["invalid_extensions"].append(record_id)
-                display_name = getattr(record, "display_name", None)
-                try:
-                    display_name_valid = isinstance(display_name, str) and normalize_display_name(display_name) == display_name
-                except ValueError:
-                    display_name_valid = False
-                if not display_name_valid:
-                    report["invalid_display_names"].append(record_id)
-                try:
-                    validate_business_storage_key(storage_key)
-                except ValueError:
-                    report["non_flat_keys"].append(storage_key or record_id)
-                if not (sha_valid and extension_valid and storage_key == f"{sha256}{extension}"):
-                    report["non_content_addressed_keys"].append(record_id)
-                if sha_valid and extension_valid:
-                    content_identity = (sha256, extension)
-                    previous_id = content_records.get(content_identity)
-                    if previous_id is None:
-                        content_records[content_identity] = record_id
-                    else:
-                        report["duplicate_content"].append(
-                            {
-                                "sha256": sha256,
-                                "extension": extension,
-                                "meme_ids": [previous_id, record_id],
-                            }
-                        )
-                # 无效 key 不能进入 BlobStore 解析器；这既避免把预检异常升级成启动崩溃，
-                # 也确保报告明确区分结构性脏记录与真实文件缺失。
-                try:
-                    storage_key_valid = validate_business_storage_key(storage_key) == storage_key
-                except ValueError:
-                    storage_key_valid = False
-                if not storage_key_valid or not sha_valid or not extension_valid:
-                    continue
-                if not self.blob_store.exists_with_identity(storage_key):
-                    report["missing_files"].append(record_id)
-                elif not self.blob_store.exists_with_identity(storage_key, sha256=sha256, size_bytes=record.size_bytes):
-                    report["mismatched"].append(record_id)
-            for path in self.blob_store.root.rglob("*"):
-                if not path.is_file() or path.is_symlink() or path.is_relative_to(self.blob_store.staging_root) or path.is_relative_to(self.blob_store.quarantine_root):
-                    continue
-                key = path.relative_to(self.blob_store.root).as_posix()
-                if "/" in key and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    report["nested_images"].append(key)
-                elif key not in referenced and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    report["orphan_files"].append(key)
-            operations = list(session.scalars(select(StorageOperation).where(StorageOperation.scope_id == self.scope.scope_id, StorageOperation.status.in_(tuple(self._ACTIVE)))))
-            for operation in operations:
-                fields = []
-                if operation.operation_type == "upload":
-                    fields = [operation.target_key]
-                elif operation.operation_type == "rename":
-                    fields = [operation.source_key, operation.target_key]
-                elif operation.operation_type == "delete":
-                    fields = [operation.source_key]
-                for value in fields:
-                    if value:
-                        try:
-                            validate_business_storage_key(value)
-                        except ValueError:
-                            report["non_flat_keys"].append(value)
-            report["active_operations"] = [str(item.id) for item in operations]
+        records, operations = self._scan_snapshot()
+        referenced: set[str] = set()
+        content_records: dict[tuple[str, str], str] = {}
+        for record in records:
+            storage_key = record.storage_key if isinstance(record.storage_key, str) else ""
+            if storage_key:
+                referenced.add(storage_key)
+            record_id = str(record.id)
+            sha256 = record.sha256 if isinstance(record.sha256, str) else ""
+            extension = record.extension if isinstance(record.extension, str) else ""
+            sha_valid = re.fullmatch(r"[0-9a-f]{64}", sha256) is not None
+            extension_valid = extension in SUPPORTED_EXTENSIONS and extension == extension.lower()
+            if not sha_valid:
+                report["invalid_sha256"].append(record_id)
+            if not extension_valid:
+                report["invalid_extensions"].append(record_id)
+            display_name = getattr(record, "display_name", None)
+            try:
+                display_name_valid = isinstance(display_name, str) and normalize_display_name(display_name) == display_name
+            except ValueError:
+                display_name_valid = False
+            if not display_name_valid:
+                report["invalid_display_names"].append(record_id)
+            try:
+                storage_key_valid = validate_business_storage_key(storage_key) == storage_key
+            except ValueError:
+                storage_key_valid = False
+                report["non_flat_keys"].append(storage_key or record_id)
+            if not (sha_valid and extension_valid and storage_key == f"{sha256}{extension}"):
+                report["non_content_addressed_keys"].append(record_id)
+            if sha_valid and extension_valid:
+                content_identity = (sha256, extension)
+                previous_id = content_records.get(content_identity)
+                if previous_id is None:
+                    content_records[content_identity] = record_id
+                else:
+                    report["duplicate_content"].append({"sha256": sha256, "extension": extension, "meme_ids": [previous_id, record_id]})
+            # 无效身份只进入结构报告，不交给文件解析器。
+            if not storage_key_valid or not sha_valid or not extension_valid:
+                continue
+            if not self.blob_store.exists_with_identity(storage_key):
+                report["missing_files"].append(record_id)
+            elif not self.blob_store.exists_with_identity(storage_key, sha256=sha256, size_bytes=record.size_bytes):
+                report["mismatched"].append(record_id)
+        for path in self.blob_store.root.rglob("*"):
+            if not path.is_file() or path.is_symlink() or path.is_relative_to(self.blob_store.staging_root) or path.is_relative_to(self.blob_store.quarantine_root):
+                continue
+            key = path.relative_to(self.blob_store.root).as_posix()
+            if "/" in key and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                report["nested_images"].append(key)
+            elif key not in referenced and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                report["orphan_files"].append(key)
+        for operation in operations:
+            fields = []
+            if operation.operation_type == "upload":
+                fields = [operation.target_key]
+            elif operation.operation_type == "rename":
+                fields = [operation.source_key, operation.target_key]
+            elif operation.operation_type == "delete":
+                fields = [operation.source_key]
+            for value in fields:
+                if value:
+                    try:
+                        validate_business_storage_key(value)
+                    except ValueError:
+                        report["non_flat_keys"].append(value)
+        report["active_operations"] = [str(item.id) for item in operations]
         return report
 
     def integrity_scan(self) -> dict[str, Any]:
-        """双向核对数据库 Meme 与文件对象，标记缺失/指纹冲突并报告孤立文件。"""
+        """在事务外检查文件，逐项取得身份锁并复核快照后标记待修复记录。"""
         report: dict[str, Any] = {"orphan_files": [], "missing_files": [], "mismatched": [], "path_conflicts": [], "active_operations": []}
-        with self.resources.factory() as session:
-            records = list(session.scalars(select(Meme).where(Meme.scope_id == self.scope.scope_id)))
-            referenced: set[str] = set()
-            duplicate_keys: dict[str, list[str]] = {}
-            for record in records:
-                referenced.add(record.storage_key)
-                duplicate_keys.setdefault(record.storage_key, []).append(str(record.id))
+        records, operations = self._scan_snapshot()
+        referenced: set[str] = set()
+        duplicate_keys: dict[str, list[str]] = {}
+        for record in records:
+            referenced.add(record.storage_key)
+            duplicate_keys.setdefault(record.storage_key, []).append(str(record.id))
+            with self.blob_store.identity_lock(record.sha256, record.extension):
+                problem = None
                 if not self.blob_store.exists_with_identity(record.storage_key):
-                    report["missing_files"].append(str(record.id))
-                    record.context_status = "repair_required"
+                    problem = "missing_files"
+                elif not self.blob_store.exists_with_identity(record.storage_key, sha256=record.sha256, size_bytes=record.size_bytes):
+                    problem = "mismatched"
+                if problem is None:
                     continue
-                if not self.blob_store.exists_with_identity(record.storage_key, sha256=record.sha256, size_bytes=record.size_bytes):
-                    report["mismatched"].append(str(record.id))
-                    record.context_status = "repair_required"
-            for path in self.blob_store.root.rglob("*"):
-                if not path.is_file() or path.is_symlink() or path.is_relative_to(self.blob_store.staging_root) or path.is_relative_to(self.blob_store.quarantine_root):
-                    continue
-                key = path.relative_to(self.blob_store.root).as_posix()
-                if key not in referenced and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    report["orphan_files"].append(key)
-            report["path_conflicts"] = [ids for ids in duplicate_keys.values() if len(ids) > 1]
-            report["active_operations"] = [str(item.id) for item in session.scalars(select(StorageOperation).where(StorageOperation.scope_id == self.scope.scope_id, StorageOperation.status.in_(tuple(self._ACTIVE))))]
-            session.commit()
+                with self._transaction() as session:
+                    current = session.get(Meme, record.id, with_for_update=True)
+                    if current is None or current.scope_id != self.scope.scope_id or (current.storage_key, current.sha256, current.size_bytes, current.extension, current.updated_at) != (record.storage_key, record.sha256, record.size_bytes, record.extension, record.updated_at):
+                        raise DatabaseError("storage_scan_target_changed")
+                    current.context_status = "repair_required"
+                    current.updated_at = utcnow()
+                report[problem].append(str(record.id))
+        for path in self.blob_store.root.rglob("*"):
+            if not path.is_file() or path.is_symlink() or path.is_relative_to(self.blob_store.staging_root) or path.is_relative_to(self.blob_store.quarantine_root):
+                continue
+            key = path.relative_to(self.blob_store.root).as_posix()
+            if key not in referenced and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                report["orphan_files"].append(key)
+        report["path_conflicts"] = [ids for ids in duplicate_keys.values() if len(ids) > 1]
+        report["active_operations"] = [str(item.id) for item in operations]
         return report

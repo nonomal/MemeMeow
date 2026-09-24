@@ -281,6 +281,18 @@ class PostgresMetadataService:
         return record, image
 
     def create_pending(self, image: Path, *, status: str = "pending", meme_id: UUID | None = None) -> SidecarMetadata:
+        """在内容身份锁内登记已有图片，等待及文件读取期间不持有数据库连接。"""
+        key = self._relative(image)
+        try:
+            expected_key = content_addressed_key(Path(key).stem, image.suffix)
+        except (TypeError, ValueError) as exc:
+            raise MetadataError("content_addressed_key_required") from exc
+        if key != expected_key:
+            raise MetadataError("content_addressed_key_required")
+        with self.blob_store.identity_lock(Path(key).stem, image.suffix):
+            return self._create_pending_locked(image, status=status, meme_id=meme_id)
+
+    def _create_pending_locked(self, image: Path, *, status: str, meme_id: UUID | None) -> SidecarMetadata:
         """为内容寻址图片幂等创建数据库 Meme 和 pending 语境。
 
         该入口用于已有物理图片首次登记；历史人类文件名不在请求内自动迁移，交由
@@ -357,13 +369,16 @@ class PostgresMetadataService:
         return context, provenance, extensions
 
     def update_context(self, image: Path, context_updates: dict[str, object], *, producer: str, model: str | None = None, status: str = "partial", error: str | None = None, expected_revision: int | None = None, expected_sha256: str | None = None, claim: tuple[str, int, str] | None = None, agent_context: dict[str, object] | None = None) -> SidecarMetadata:
-        """在一个事务中更新数据库语境，并用 revision/SHA 防止过期任务覆盖。"""
+        """校验文件后按已有记录 ID 更新语境，保留 revision/SHA 与任务条件。"""
         key = self._relative(image)
+        snapshot = self._record(image)
         identity = self._identity(image)
         with self.resources.environment(self.scope.scope_id) as environment:
-            record = environment.memes.by_storage_key(key, for_update=True)
+            record = environment.memes.get(snapshot.id, for_update=True)
             if record is None:
-                record = environment.memes.create(storage_key=key, extension=str(identity["extension"]), size_bytes=int(identity["size_bytes"]), sha256=str(identity["sha256"]), context=self._base_context(), provenance={"producer": "system", "updated_at": datetime.now(timezone.utc).isoformat(), "field_sources": {}}, status="pending")
+                raise MetadataError("metadata_missing")
+            if (record.storage_key, record.sha256, record.size_bytes, record.extension) != (key, identity["sha256"], identity["size_bytes"], identity["extension"]):
+                raise MetadataError("target_changed")
             current = self._to_sidecar(record)
             context, provenance, extensions = self._merge_payload(current, context_updates, producer=producer, model=model, status=status, error=error, agent_context=agent_context)
             try:
