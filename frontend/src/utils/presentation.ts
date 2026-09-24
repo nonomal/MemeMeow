@@ -126,6 +126,7 @@ export function taskTypeLabel(type?: string): string {
   return {
     meme_context_generation: '语境生成',
     cache_generation: '检索缓存',
+    image_library_processing: '未就绪图片扫描',
     metadata_repair: '元数据修复',
     derived_thumbnail_generation: '缩略图生成',
     visual_embedding_generation: '图片向量生成',

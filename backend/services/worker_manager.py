@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Mapping
 
 from sqlalchemy import or_, select
+from loguru import logger as diagnostic_logger
 
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
@@ -94,6 +95,7 @@ class PostgresTaskWorkerManager:
         self._lock = Lock()
         self._stopped = Event()
         self._started = False
+        self._recovery_thread: Thread | None = None
         self._scheduled: set[str] = set()
         self.owner = f"worker-{os.getpid()}-{id(self)}"
 
@@ -104,6 +106,11 @@ class PostgresTaskWorkerManager:
         except ValueError as exc:
             raise DatabaseError("agent_resource_key_invalid") from exc
         return self.resource_concurrency.get(key, self.agent_concurrency)
+
+    @property
+    def stopping(self) -> bool:
+        """告知协作式处理器进程正在关闭，允许保存进度后结束执行。"""
+        return self._stopped.is_set()
 
     @property
     def worker_count(self) -> int:
@@ -149,11 +156,22 @@ class PostgresTaskWorkerManager:
                 )
             for task_id in dict.fromkeys(queued):
                 self.schedule(task_id)
+            self._recovery_thread = Thread(target=self._recovery_loop, name="mememeow-task-recovery", daemon=True)
+            self._recovery_thread.start()
             return {"started": [self.owner], "invalid_tasks": sorted(set(invalid))}
         except Exception:
             with self._lock:
                 self._started = False
             raise
+
+    def _recovery_loop(self) -> None:
+        """持续恢复过期租约和已到执行时间的任务，覆盖启动后才过期的任务。"""
+        while not self._stopped.wait(5):
+            try:
+                self._recover_expired()
+                self._schedule_queued()
+            except Exception as exc:
+                diagnostic_logger.exception("task_recovery_error error_type={}", type(exc).__name__)
 
     def _recover_expired(self) -> list[str]:
         """跨所有 scope 恢复过期 claim，并释放旧 lane 槽位。"""
@@ -456,8 +474,10 @@ class PostgresTaskWorkerManager:
                     select(Task.id)
                     .where(
                         Task.status == "queued",
+                        Task.available_at <= utcnow(),
                         _generic_task_filter(),
                     )
+                    .order_by(Task.available_at, Task.id)
                     .limit(500)
                 )
             )
@@ -467,10 +487,15 @@ class PostgresTaskWorkerManager:
     def shutdown(self) -> None:
         """停止调度并等待本进程持有的任务退出后再释放线程池。"""
         self._stopped.set()
+        if self._recovery_thread is not None:
+            self._recovery_thread.join()
         now = utcnow()
         with self.resources.factory() as session:
             rows = list(session.scalars(select(Task).where(Task.status == "running", Task.lease_owner == self.owner).with_for_update(skip_locked=True)))
             for task in rows:
+                if task.task_type == "image_library_processing":
+                    # 扫描器在图片之间响应关闭，仍在执行的操作保留租约直到返回。
+                    continue
                 interrupted_error = {"error": "task_interrupted", "message": "任务执行 Worker 已停止"}
                 append_task_error_history(
                     task,

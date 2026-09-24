@@ -502,6 +502,11 @@ def sanitize_task_result(task_type: object, value: object) -> dict[str, Any] | N
         dimensions = _safe_int(value.get("dimensions"), maximum=100_000)
         if dimensions is not None:
             result["dimensions"] = dimensions
+    elif task_type == "image_library_processing":
+        for key in ("scanned_count", "submitted_count", "conflict_count", "not_needed_count"):
+            safe = _safe_int(value.get(key))
+            if safe is not None:
+                result[key] = safe
     elif task_type == "metadata_repair":
         for key in ("processed", "created", "repaired", "repair_required"):
             safe = _safe_int(value.get(key))

@@ -25,12 +25,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import select
 from contextlib import nullcontext
 from sqlalchemy.orm import Session
 
 from backend.config import Settings, validate_agent_concurrency
+from backend.library_processing import LIBRARY_TASK_TYPE, run_library_processing, submit_library_processing
 from backend.collection_packages import (
     CollectionPackageError,
     DEFAULT_MAX_FILE_SIZE,
@@ -1256,6 +1258,23 @@ async def lifespan(app: FastAPI):
             progress(1.0, "单图文本向量已保存")
         return {"meme_id": meme_id, "metadata_hash": frozen_metadata_hash, "embedding_model": app.state.settings.embedding_model}
 
+    def library_processing_handler(payload: dict[str, Any], progress: Callable[..., Any]) -> dict[str, int]:
+        """从持久 Task 恢复服务与处理参数，后台枚举未就绪图片。"""
+        services = app.state.service_factory.for_task(payload["_claim_task_id"])
+        worker = _scope_processing_worker(app, services.scope)
+        if worker is None:
+            raise ImageProcessingError("image_processing_unavailable")
+
+        def process_image(record: Meme, options: dict[str, Any]) -> str:
+            """核验图片当前产物，仅为缺失阶段创建处理 Job。"""
+            readiness = _scope_image_readiness(app, services.scope, record, options["reverse_image_policy"], auto_name=options["auto_name"])
+            if all(readiness.values()):
+                return "not_needed_count"
+            worker.submit(record.id, record.sha256, metadata_hash=ImageProcessingWorker._metadata_hash(record), config=_application_processing_config(app), reverse_image_policy=options["reverse_image_policy"], auto_name=options["auto_name"], processing_mode="repair", readiness=readiness, schedule=True)
+            return "submitted_count"
+
+        return run_library_processing(services.tasks, payload, process_image, progress)
+
     def register_handlers(services: ScopeServices | None = None, *, manager: PostgresTaskWorkerManager | None = None) -> None:
         """向进程级 manager 注册处理器，并为 scope facade 安装批次收束回调。"""
         register = services.tasks.register if services is not None else getattr(manager or worker_manager, "register", None)
@@ -1263,6 +1282,7 @@ async def lifespan(app: FastAPI):
             return
         register("cache_generation", cache_handler)
         register("metadata_repair", repair_handler)
+        register(LIBRARY_TASK_TYPE, library_processing_handler)
         register("derived_thumbnail_generation", thumbnail_handler)
         register("visual_embedding_generation", visual_handler)
         register("meme_context_generation", context_handler)
@@ -1424,29 +1444,33 @@ def _submit_processing_job_for_image(request: Request, record: Meme, image: Path
 
 def _processing_worker(request: Request) -> ImageProcessingWorker | None:
     """按 scope 惰性获取图片处理 Worker；Worker 不共享可变 scope。"""
-    workers = getattr(request.app.state, "image_processing_workers", None)
+    return _scope_processing_worker(request.app, _request_scope(request))
+
+
+def _scope_processing_worker(application: FastAPI, scope: ScopeContext) -> ImageProcessingWorker | None:
+    """为可信 scope 获取图片 Worker，供 HTTP 与持久任务共同调用。"""
+    workers = getattr(application.state, "image_processing_workers", None)
     if not isinstance(workers, dict):
         return None
-    scope = _request_scope(request)
-    lock = getattr(request.app.state, "image_processing_workers_lock", None)
+    lock = getattr(application.state, "image_processing_workers_lock", None)
     if lock is None:
-        lock = request.app.state.image_processing_workers_lock = RLock()
+        lock = application.state.image_processing_workers_lock = RLock()
     with lock:
         worker = workers.get(scope.scope_id)
         if worker is not None:
             return worker
-        factory = getattr(request.app.state, "service_factory", None)
+        factory = getattr(application.state, "service_factory", None)
         if not callable(getattr(factory, "for_scope", None)):
             return None
         services = validate_scope_services(scope, factory.for_scope(scope))
         worker = ImageProcessingWorker(
-            request.app.state.database,
+            application.state.database,
             scope_id=scope,
             task_service=services.tasks,
-            policy=getattr(request.app.state, "operation_policy_gateway", None),
-            grant_store=getattr(request.app.state, "operation_grants", None),
-            max_workers=validate_agent_concurrency(getattr(request.app.state.settings, "opencode_concurrency", 1)),
-            task_handlers=getattr(request.app.state, "image_processing_task_handlers", None),
+            policy=getattr(application.state, "operation_policy_gateway", None),
+            grant_store=getattr(application.state, "operation_grants", None),
+            max_workers=validate_agent_concurrency(getattr(application.state.settings, "opencode_concurrency", 1)),
+            task_handlers=getattr(application.state, "image_processing_task_handlers", None),
         )
         workers[scope.scope_id] = worker
         worker.start()
@@ -1455,10 +1479,15 @@ def _processing_worker(request: Request) -> ImageProcessingWorker | None:
 
 def _processing_config(request: Request) -> dict[str, object]:
     """从服务端配置构造影响图片处理产物的稳定指纹输入。"""
-    settings = request.app.state.settings
+    return _application_processing_config(request.app)
+
+
+def _application_processing_config(application: FastAPI) -> dict[str, object]:
+    """从应用配置读取处理参数，后台调用无需持有 HTTP 请求。"""
+    settings = application.state.settings
     identity = identity_from_settings(settings)
     try:
-        skill_hash = request.app.state.opencode.skill_hash()
+        skill_hash = application.state.opencode.skill_hash()
     except (OSError, OpenCodeError):
         skill_hash = None
     return {
@@ -1690,8 +1719,13 @@ def _core_image_readiness(request: Request, record: Meme, image: Path, policy: s
     “修复所有未就绪”逐图提交，不能只返回一个总的 ready 布尔值。
     """
     del image  # 物理身份由共享判定按当前 storage_key 重新解析并复核。
+    return _scope_image_readiness(request.app, _request_scope(request), record, policy, auto_name=auto_name)
+
+
+def _scope_image_readiness(application: FastAPI, scope: ScopeContext, record: Meme, policy: str, *, auto_name: bool = False) -> dict[str, bool]:
+    """核验指定 scope 图片的阶段产物，供请求与后台扫描复用。"""
     readiness = {"visual": False, "agent": False, "auto_rename": not auto_name, "text_embedding": False}
-    processing_repository = _processing_repository(request)
+    processing_repository = ImageProcessingRepository(application.state.database, scope)
     latest = processing_repository.latest_for_target(record.id, record.sha256)
     active_task_check = getattr(processing_repository, "has_active_image_task", None)
     if callable(active_task_check) and active_task_check(record.id, record.sha256):
@@ -1702,21 +1736,21 @@ def _core_image_readiness(request: Request, record: Meme, image: Path, policy: s
         return readiness
 
     try:
-        config = _processing_config(request)
+        config = _application_processing_config(application)
     except AttributeError:
         # 轻量兼容调用没有完整 Request 生命周期；缺少配置时只能安全地按未就绪
         # 返回，真实 HTTP 请求会在正常应用上下文中继续完成阶段核对。
         return readiness
     expected_config_hash = processing_config_hash(config)
-    if not image_file_matches(request.app.state.database, _request_scope(request), record):
+    if not image_file_matches(application.state.database, scope, record):
         return {stage: False for stage in readiness}
     metadata_hash = ImageProcessingWorker._metadata_hash(record)
 
     # 当前文件身份已确认，三个核心产物分别按当前配置和输入指纹核对，不能把
     # 某一个缺失产物连带误判为其它阶段也已就绪。
     try:
-        visual_identity = identity_from_settings(request.app.state.settings)
-        with _environment(request) as environment:
+        visual_identity = identity_from_settings(application.state.settings)
+        with application.state.database.environment(scope) as environment:
             visual = environment.visual.get(
                 record.id,
                 model=visual_identity.model,
@@ -1728,7 +1762,7 @@ def _core_image_readiness(request: Request, record: Meme, image: Path, policy: s
             if metadata_hash is not None:
                 text_row = environment.uow.session.scalar(
                     select(MemeTextEmbedding).where(
-                        MemeTextEmbedding.scope_id == _request_scope(request).scope_id,
+                        MemeTextEmbedding.scope_id == scope.scope_id,
                         MemeTextEmbedding.meme_id == record.id,
                         MemeTextEmbedding.image_sha256 == record.sha256,
                         MemeTextEmbedding.metadata_hash == metadata_hash,
@@ -1819,7 +1853,7 @@ def _core_image_ready(request: Request, record: Meme, image: Path, policy: str, 
 
 
 async def process_unready_image_library(request: Request, payload: ProcessingBatchRequest) -> dict[str, object]:
-    """在当前 scope 内以游标枚举全部核心未就绪图片并逐图提交 Job。"""
+    """提交持久图片库扫描任务，HTTP 响应仅确认后台任务已接收。"""
     unknown = set(request.query_params)
     if unknown:
         raise _error(400, "invalid_request", "未就绪处理不接受分页、筛选或 scope 参数")
@@ -1827,70 +1861,8 @@ async def process_unready_image_library(request: Request, payload: ProcessingBat
         options = _normalize_processing_options(request, reverse_image_policy=payload.reverse_image_policy, auto_name=payload.auto_name)
     except ImageProcessingError as exc:
         raise _error(503 if exc.code == "reverse_image_unavailable" else 400, exc.code, "图片处理选项无效或服务不可用") from exc
-    worker = _processing_worker(request)
-    if worker is None:
-        raise _error(503, "image_processing_unavailable", "图片处理服务当前不可用")
-    results: list[dict[str, object]] = []
-    last_id: UUID | None = None
-    while True:
-        with _environment(request) as environment:
-            statement = select(Meme).where(Meme.scope_id == _request_scope(request).scope_id)
-            if last_id is not None:
-                # storage_key 会被自动重命名阶段异步改变，不能作为分页游标；
-                # Meme ID 不可变，才能保证一次请求不会重复或漏扫目标。
-                statement = statement.where(Meme.id > last_id)
-            rows = list(environment.uow.session.scalars(statement.order_by(Meme.id.asc()).limit(100)))
-        if not rows:
-            break
-        for meme in rows:
-            last_id = meme.id
-            try:
-                image = _service(request, "metadata").blob_store.resolve(meme.storage_key)
-                readiness = _core_image_readiness(
-                    request,
-                    meme,
-                    image,
-                    options.reverse_image_policy,
-                    auto_name=options.auto_name,
-                )
-                if all(readiness[stage] for stage in ("visual", "agent", "text_embedding")) and (
-                    not options.auto_name or readiness["auto_rename"]
-                ):
-                    # 首次扫描时已就绪的图片不是修复目标；只有图片锁内复核后
-                    # 转为就绪的候选才需要返回 not_needed。
-                    continue
-                snapshot = worker.submit(
-                    meme.id,
-                    meme.sha256,
-                    metadata_hash=ImageProcessingWorker._metadata_hash(meme),
-                    config=_processing_config(request),
-                    reverse_image_policy=options.reverse_image_policy,
-                    auto_name=options.auto_name,
-                    processing_mode="repair",
-                    readiness=readiness,
-                    schedule=True,
-                )
-                results.append(
-                    {
-                        "meme_id": str(meme.id),
-                        "processing_job_id": snapshot.job_id,
-                        "category": "submitted",
-                    }
-                )
-            except ImageProcessingError as exc:
-                if exc.code == "image_processing_active":
-                    results.append({"meme_id": str(meme.id), "reason": exc.code, "category": "processing_active"})
-                elif exc.code == "already_ready":
-                    results.append({"meme_id": str(meme.id), "reason": "already_ready", "category": "not_needed"})
-                else:
-                    results.append({"meme_id": str(meme.id), "reason": exc.code, "category": "failed"})
-            except Exception:  # noqa: BLE001 - 单图提交必须隔离异常并继续枚举其它图片
-                results.append({"meme_id": str(meme.id), "error": "image_processing_failed", "reason": "image_processing_failed", "category": "failed"})
-    submitted = sum(1 for item in results if item.get("category") == "submitted")
-    conflicts = sum(1 for item in results if item.get("category") == "processing_active")
-    not_needed = sum(1 for item in results if item.get("category") == "not_needed")
-    failed = sum(1 for item in results if item.get("category") == "failed")
-    return {"target_count": len(results), "submitted_count": submitted, "reused_count": 0, "conflict_count": conflicts, "not_needed_count": not_needed, "failed_count": failed, "results": results}
+    task = await run_in_threadpool(submit_library_processing, _service(request, "tasks"), {"reverse_image_policy": options.reverse_image_policy, "auto_name": options.auto_name})
+    return {"task_id": task.task_id, "status": task.status}
 
 
 @app.post("/image-processing/{job_id}/retry", status_code=202, tags=["images", "tasks"], include_in_schema=False)

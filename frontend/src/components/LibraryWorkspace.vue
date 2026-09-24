@@ -3,7 +3,7 @@
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { api } from '../api'
 import { showTaskDiagnostics } from '../config/debug'
-import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingOptions, ImageProcessingStage, MemeImage, SelectedImageRetryMode, ServiceConfig, TaskItem, UnreadyProcessingResponse } from '../types'
+import type { CollectionSummary, CoreImageProcessingStage, ImageProcessingBatchResponse, ImageProcessingOptions, ImageProcessingStage, MemeImage, SelectedImageRetryMode, ServiceConfig, TaskItem, UnreadyProcessingResponse } from '../types'
 import {
   embeddingLabel,
   errorMessage,
@@ -67,7 +67,7 @@ const stageBusy = shallowRef('')
 const processingOptionsOpen = shallowRef(false)
 const processingOptionsTarget = shallowRef<ProcessingOptionsTarget | null>(null)
 const processingOptionsTrigger = shallowRef<HTMLElement | null>(null)
-const retryDetails = shallowRef<UnreadyProcessingResponse['results']>([])
+const retryDetails = shallowRef<ImageProcessingBatchResponse['results']>([])
 const retryOptions = shallowRef<ImageProcessingOptions>(defaultProcessingOptions())
 const preserveRetryOptions = shallowRef(false)
 const retrySelectedDialogOpen = shallowRef(false)
@@ -243,7 +243,7 @@ function processingStage(item: MemeImage, stage: ImageProcessingStageName): Imag
 
 type ImageProcessingStageName = 'visual' | 'agent' | 'auto_rename' | 'text_embedding'
 
-type RetryResult = UnreadyProcessingResponse['results'][number]
+type RetryResult = ImageProcessingBatchResponse['results'][number]
 
 /** 将服务端逐图结果收束为新的四种提交分类，兼容旧字段读取。 */
 function retryResultCategory(result: RetryResult): 'submitted' | 'processing_active' | 'not_needed' | 'failed' {
@@ -403,8 +403,8 @@ async function confirmUnreadyOptions(options: ImageProcessingOptions): Promise<v
   retryBusy.value = true
   try {
     const response = await submitUnreadyProcessing(options) as UnreadyProcessingResponse
-    retryDetails.value = response.results || []
-    retryNotice.value = `修复未就绪：目标 ${response.target_count ?? 0}，提交 ${response.submitted_count ?? 0}，处理中 ${response.conflict_count ?? 0}，无需修复 ${response.not_needed_count ?? 0}，失败 ${response.failed_count ?? 0}`
+    retryDetails.value = []
+    retryNotice.value = `后台扫描已接收，可在任务页面查看进度。任务：${response.task_id}`
     processingOptionsOpen.value = false
     processingOptionsTarget.value = null
     // 请求已经返回后关闭本次确认；下一次打开不得继承可能更高风险的选择。

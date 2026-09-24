@@ -179,10 +179,9 @@ class TaskRepository:
         owner: str,
         updates: Mapping[str, Any],
     ) -> bool:
-        """在当前 claim 租约内合并任务迁移字段，避免旧 Worker 覆盖新输入。
+        """在当前 claim 租约内合并持久输入和进度，拒绝过期执行者写入。
 
-        该方法只用于后端为 protocol v2 补齐的稳定字段；调用方必须在同一 claim
-        内传入已校验的 JSON 值，事务提交由外层环境负责。
+        后端迁移与后台扫描传入已校验的 JSON 值，事务提交由外层环境负责。
         """
         if not isinstance(updates, Mapping):
             raise DatabaseError("visual_match_snapshot_invalid")

@@ -138,6 +138,10 @@ export interface TaskItem {
   image?: TaskImage
   error?: { error?: string; message?: string }
   result?: {
+    scanned_count?: number
+    submitted_count?: number
+    conflict_count?: number
+    not_needed_count?: number
     auto_named?: boolean
     saved_filename?: string
     auto_name_error?: string
@@ -212,6 +216,11 @@ export interface UploadResult {
 }
 
 export interface UnreadyProcessingResponse {
+  task_id: string
+  status: string
+}
+
+export interface ImageProcessingBatchResponse {
   target_count: number
   submitted_count: number
   reused_count: number

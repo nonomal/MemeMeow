@@ -211,6 +211,11 @@ class PostgresTaskService:
         self._scheduled: set[str] = set()
         self.owner = worker_manager.owner if worker_manager is not None else f"worker-{os.getpid()}-{id(self)}"
 
+    @property
+    def stopping(self) -> bool:
+        """返回所属执行器的关闭状态，供可恢复任务在业务步骤之间检查。"""
+        return self._worker_manager.stopping if self._worker_manager is not None else self._stopped.is_set()
+
     def resource_capacity(self, resource_key: str | None) -> int:
         """返回资源 key 的运行容量；缺失映射时继承全局 Agent 容量。"""
         try:
@@ -251,6 +256,8 @@ class PostgresTaskService:
     @staticmethod
     def _dedupe(task_type: str, payload: dict[str, Any]) -> str:
         """为普通任务和图片阶段任务生成包含来源模式的稳定活动去重键。"""
+        if task_type == "image_library_processing":
+            return "library:" + json.dumps(payload.get("options", {}), sort_keys=True, separators=(",", ":"))
         mode = str(payload.get("submission_mode") or ("pipeline" if payload.get("job_id") else "legacy"))
         stage = str(payload.get("stage") or {
             "visual_embedding_generation": "visual",
