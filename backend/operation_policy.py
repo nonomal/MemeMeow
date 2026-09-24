@@ -403,6 +403,23 @@ class OperationPolicyGateway:
         self.policy = policy if policy is not None else UnavailableOperationPolicy()
         self.allow_all = allow_all
 
+    @property
+    def uses_task_settlement(self) -> bool:
+        """宿主提供任务结算扩展时，由任务终态决定 Agent 计量。"""
+        return callable(getattr(self.policy, "settle_task", None))
+
+    def prepare_task(self, grant: GrantRef) -> datetime:
+        """取得宿主预留的固定截止时间，供 Worker 保存到可信任务字段。"""
+        deadline = self.policy.prepare_task(grant)
+        if not isinstance(deadline, datetime) or deadline.tzinfo is None:
+            raise OperationPolicyError("agent_reservation_deadline_invalid")
+        return deadline
+
+    def settle_task(self, session: Any, scope: ScopeContext, task_id: str) -> None:
+        """复用调用方事务，将任务最终状态交给宿主完成计量。"""
+        if self.uses_task_settlement:
+            self.policy.settle_task(session, scope, task_id)
+
     @staticmethod
     def request(scope: ScopeContext | str, operation: str, idempotency_key: str, **kwargs: Any) -> OperationRequest:
         """从服务端事实构造 policy request，忽略客户端身份字段。"""

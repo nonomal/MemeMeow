@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from backend.agent_resume import append_error_history, append_task_error_history, normalize_identifier, sanitize_error
 from executor.agent_limits import validate_agent_concurrency, validate_agent_concurrency_at_most
 from backend.persistence.engine import DatabaseError
+from backend.task_deadline import ensure_task_deadline
 from backend.persistence.models import (
     Meme,
     ImageProcessingJob,
@@ -1561,6 +1562,7 @@ class TaskRepository:
         )
         if task is None:
             return False
+        ensure_task_deadline(task.payload or {}, now)
         task.status = "succeeded"
         task.progress = 1.0
         task.message = "任务完成"

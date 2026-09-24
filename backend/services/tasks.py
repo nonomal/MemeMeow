@@ -1043,7 +1043,7 @@ class PostgresTaskService:
             return False
 
     def _commit_agent_grant(self, claim: Task, payload: dict[str, Any]) -> None:
-        """在 Agent 外部执行前幂等提交服务端 grant。"""
+        """校验 Agent grant，并保存宿主预留期限或提交执行授权。"""
         operation_policy = getattr(self, "_operation_policy", None)
         grant_store = getattr(self, "_grant_store", None)
         if claim.task_type != "meme_context_generation" or operation_policy is None or grant_store is None:
@@ -1115,6 +1115,12 @@ class PostgresTaskService:
         # 事实恢复；兼容测试夹具没有该扩展点时仍使用当前内存 payload。
         if mode == "standalone" and callable(getattr(self, "_persist_claim_payload_updates", None)):
             self._persist_claim_payload_updates(claim, {"agent_grant_key": logical_key})
+        if operation_policy.uses_task_settlement:
+            deadline = operation_policy.prepare_task(association.grant)
+            updates = {"agent_reservation_expires_at": deadline.isoformat()}
+            self._persist_claim_payload_updates(claim, updates)
+            payload.update(updates)
+            return
         try:
             result = self._operation_policy.commit(association.grant)
         except OperationPolicyError:
@@ -1666,17 +1672,16 @@ class PostgresTaskService:
                         # 先把已校验的 snapshot 摘要绑定到当前 attempt；即使后续
                         # grant 或 OpenCode 失败，恢复器也只能复用这一份事实。
                         self._image_attempt_state(claim, task_payload, "prepared")
-                    # 图片阶段均可能触发外部模型或持久副作用；Agent 先完成
-                    # grant commit，再进入外部执行窗口，恢复者才能区分计量边界。
+                    # 宿主结算策略可保留预留，外部执行阶段单独记录恢复事实。
                     self._commit_agent_grant(claim, task_payload)
                     task_payload["_agent_grant_committed"] = True
-                    if claim.task_type == "meme_context_generation":
+                    if claim.task_type == "meme_context_generation" and not (self._operation_policy is not None and self._operation_policy.uses_task_settlement):
                         self._image_attempt_state(claim, task_payload, "grant_committed")
                     # 恢复者无法证明结果时必须收束 unknown_execution。
                     self._image_attempt_state(claim, task_payload, "external_started")
                 result = handler(task_payload, progress)
             except Exception as exc:  # noqa: BLE001
-                if not task_payload.get("_agent_grant_committed"):
+                if not task_payload.get("_agent_grant_committed") and not (self._operation_policy is not None and self._operation_policy.uses_task_settlement):
                     self._release_uncommitted_agent_grant(claim, task_payload)
                 if isinstance(exc, OperationPolicyError):
                     code = exc.code
@@ -1711,6 +1716,8 @@ class PostgresTaskService:
                     max_seconds=self.resume_max_backoff_seconds,
                 )
                 retry = code not in {
+                    "agent_reservation_expired",
+                    "agent_reservation_deadline_invalid",
                     "target_changed",
                     "agent_output_schema_invalid",
                     "agent_output_invalid_json",
@@ -1796,7 +1803,16 @@ class PostgresTaskService:
                 # 只有当前 claim 仍有效时才写入任务终态和 Meme provenance。
                 self._image_attempt_state(claim, task_payload, "completed")
                 audit_result = self._with_reverse_image_audit(task_id, result, write_provenance=False)
-                self._fenced_success(task_id, generation, audit_result)
+                try:
+                    self._fenced_success(task_id, generation, audit_result)
+                except DatabaseError as exc:
+                    if str(exc) != "agent_reservation_expired":
+                        raise
+                    self._fenced_failure(
+                        task_id, generation, message="额度预留已到期",
+                        error={"error": "agent_reservation_expired", "message": "额度预留已达到 24 小时"},
+                        retry=False,
+                    )
             finally:
                 heartbeat_stop.set()
             self._maybe_finalize(task_id)
@@ -1836,7 +1852,10 @@ class PostgresTaskService:
         with self.resources.environment(self.scope.scope_id) as environment:
             complete = getattr(environment.tasks, "complete_fenced_with_provenance", None)
             if callable(complete):
-                return bool(complete(task_id, generation, self.owner, result=result))
+                changed = bool(complete(task_id, generation, self.owner, result=result))
+                if changed and self._operation_policy is not None:
+                    self._operation_policy.settle_task(environment.uow.session, self.scope, task_id)
+                return changed
             # 兼容尚未提供原子扩展的宿主 repository；标准 PostgreSQL
             # repository 始终走上面的单事务路径。
             changed = environment.tasks.update_fenced(
@@ -1869,6 +1888,8 @@ class PostgresTaskService:
                 session_id=session_id,
                 executor_attempt_id=executor_attempt_id,
             )
+            if changed and not _should_retry and self._operation_policy is not None:
+                self._operation_policy.settle_task(environment.uow.session, self.scope, task_id)
         # 当前执行线程的 ``finally`` 会在释放本地调度标记后统一扫描 queued
         # 任务。这里不能提前按 task_id 单独提交新的 future：preclaimed 的
         # 兼容调用可能尚未登记调度标记，会让同一任务在旧 claim 收束事务刚

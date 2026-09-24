@@ -156,6 +156,8 @@ STABLE_TASK_ERRORS = {
     "operation_limit_exceeded",
     "operation_policy_unavailable",
     "operation_grant_invalid",
+    "agent_reservation_expired",
+    "agent_reservation_deadline_invalid",
     "blocked",
     "agent_provider_rate_limited",
     "agent_provider_server_error",

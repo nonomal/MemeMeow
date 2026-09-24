@@ -19,6 +19,7 @@ from backend.image_naming import normalize_display_name, normalize_extension, sa
 from backend.paths import validate_business_storage_key
 from backend.persistence.engine import DatabaseError
 from backend.persistence.models import Meme, ScopeContext, StorageOperation, Task, utcnow
+from backend.task_deadline import ensure_task_deadline
 
 
 ImageSort = Literal["name_asc", "updated_desc"]
@@ -193,6 +194,7 @@ class MemeRepository:
             task = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
             if task is None or task.status != "running" or task.claim_generation != claim_generation or task.lease_owner != owner or task.lease_expires_at is None or task.lease_expires_at <= now:
                 raise DatabaseError("claim_expired")
+            ensure_task_deadline(task.payload or {}, now)
         if expected_revision is not None and record.revision != expected_revision:
             raise DatabaseError("target_changed")
         if expected_sha256 is not None and record.sha256 != expected_sha256:

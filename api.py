@@ -741,7 +741,7 @@ async def lifespan(app: FastAPI):
                     raise RuntimeError("operation_grant_invalid")
                 grant = association.grant
                 try:
-                    if association.state == "acquired":
+                    if association.state == "acquired" and not gateway.uses_task_settlement:
                         commit_result = gateway.commit(grant)
                         if not commit_result.ok:
                             raise OperationPolicyError(commit_result.reason or "operation_policy_unavailable", retry_at=commit_result.retry_at)
