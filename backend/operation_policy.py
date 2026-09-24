@@ -439,6 +439,11 @@ class OperationPolicyGateway:
         except Exception as exc:  # noqa: BLE001 - 不泄露宿主策略异常
             raise OperationPolicyError("operation_policy_unavailable") from exc
 
+    def persists_grant(self, request: OperationRequest) -> bool:
+        """询问宿主是否在配额事务中原子保存公共 grant，供持久仓储选择写入者。"""
+        method = getattr(self.policy, "persists_grant", None)
+        return bool(method(request)) if callable(method) else False
+
     def acquire(self, request: OperationRequest) -> PolicyDecision:
         """执行真实副作用前的原子授权。"""
         try:
@@ -765,6 +770,13 @@ class PersistentGrantRepository:
         """在 scope/operation/key advisory lock 下只向宿主 policy acquire 一次。"""
         if request.scope != self.scope:
             raise OperationPolicyError("operation_grant_invalid")
+        if gateway.persists_grant(request):
+            # 宿主负责同一事务内的配额与 grant，调用时不持有外层连接。
+            grant = require_allowed(gateway.acquire(request))
+            association = self.get(request)
+            if association is None or association.grant != grant or association.state not in _EXECUTABLE_ASSOCIATION_STATES:
+                raise OperationPolicyError("operation_grant_invalid")
+            return association
         key = f"mememeow:grant:{self.scope.scope_id}:{request.operation}:{request.idempotency_key}"
         with self.resources.factory() as session:
             session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
