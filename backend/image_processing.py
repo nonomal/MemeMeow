@@ -13,6 +13,8 @@ import json
 import logging
 import math
 import threading
+import time
+from loguru import logger as diagnostic_logger
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
@@ -1215,6 +1217,14 @@ class ImageProcessingRepository:
             )
         return [snapshot for identifier in ids if (snapshot := self.snapshot(identifier)) is not None]
 
+    def active_ids(self, *, after_id: UUID | None = None, limit: int = 100) -> list[UUID]:
+        """按稳定游标读取活动 Job 标识，协调扫描无需逐项加载阶段和历史。"""
+        with self._session() as session:
+            statement = select(ImageProcessingJob.id).where(ImageProcessingJob.scope_id == self.scope.scope_id, ImageProcessingJob.status.in_(ACTIVE_JOB_STATUSES))
+            if after_id is not None:
+                statement = statement.where(ImageProcessingJob.id > after_id)
+            return list(session.scalars(statement.order_by(ImageProcessingJob.id).limit(max(1, min(limit, 500)))))
+
     def latest_for_target(self, meme_id: UUID | str, image_sha256: str) -> ImageProcessingSnapshot | None:
         """读取当前 scope/目标版本的最新 job，供显式批量重试判断。"""
         try:
@@ -1514,6 +1524,8 @@ class ImageProcessingWorker:
         self._stopped = threading.Event()
         self._reconcile_interval = max(0.25, min(float(reconcile_interval), 60.0))
         self._reconcile_thread: threading.Thread | None = None
+        self._reconcile_cursor: UUID | None = None
+        self._reconcile_logged_at = 0.0
         self._scheduled: set[str] = set()
         self._lock = threading.RLock()
 
@@ -2127,8 +2139,11 @@ class ImageProcessingWorker:
                     reschedule = True
                 return
             if self._task_runner is not None:
-                self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status="running", task_id=str(task_id))
-                self._task_runner.schedule(str(task_id))
+                if stage.get("status") != "running" or stage.get("task_id") != str(task_id):
+                    self.jobs.transition(job.id, name, owner=self.owner, claim_generation=job.claim_generation, status="running", task_id=str(task_id))
+                # 运行中的叶子由租约和完成检查维护，无需重复调度及写入相同状态。
+                if child is not None and child.status == "queued":
+                    self._task_runner.schedule(str(task_id))
                 return
             handler = self.handlers.get(name)
             if handler is None:
@@ -2464,11 +2479,17 @@ class ImageProcessingWorker:
 
     def reconcile(self, *, limit: int = 100) -> int:
         """扫描当前 scope 未完成 job，逐图安排恢复。"""
-        count = 0
-        for snapshot in self.jobs.list_active(limit=limit):
-            self.schedule(snapshot.job_id)
-            count += 1
-        return count
+        started = time.monotonic()
+        identifiers = self.jobs.active_ids(after_id=self._reconcile_cursor, limit=limit)
+        self._reconcile_cursor = identifiers[-1] if identifiers else None
+        for identifier in identifiers:
+            self.schedule(identifier)
+        if started - self._reconcile_logged_at >= 30:
+            self._reconcile_logged_at = started
+            with self._lock:
+                scheduled = len(self._scheduled)
+            diagnostic_logger.info("image_processing_reconcile scanned={} scheduled={} duration_ms={}", len(identifiers), scheduled, int((time.monotonic() - started) * 1000))
+        return len(identifiers)
 
     def start(self) -> int:
         """启动恢复扫描；未把全库图片 ID 放入单一任务 payload。"""

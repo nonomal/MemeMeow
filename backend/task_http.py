@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 
 from backend.agent_resume import within_total_timeout
 from backend.database import DatabaseError
@@ -208,9 +209,13 @@ async def list_tasks(
 
     输出包含 ``items`` 与 ``next_cursor``；任务查询始终通过注入的当前 scope service 完成。
     """
-    records, next_cursor = service(request, "tasks").list(statuses=set(status) or None, task_types=set(task_type) or None, cursor=cursor, limit=limit)
-    activities = read_agent_activity(request, records)
-    return {"items": [task_summary(request, record, activities, service=service, processing_repository=processing_repository) for record in records], "next_cursor": next_cursor}
+    def read_page():
+        """在线程内完成数据库读取与摘要生成，释放事件循环。"""
+        records, next_cursor = service(request, "tasks").list(statuses=set(status) or None, task_types=set(task_type) or None, cursor=cursor, limit=limit)
+        activities = read_agent_activity(request, records)
+        return {"items": [task_summary(request, record, activities, service=service, processing_repository=processing_repository) for record in records], "next_cursor": next_cursor}
+
+    return await run_in_threadpool(read_page)
 
 
 async def get_task(
@@ -226,6 +231,11 @@ async def get_task(
     找不到普通任务时只查询当前 scope 的图片处理 repository；两者均缺失时返回稳定
     ``task_not_found`` 错误，不泄露其它 scope 的任务事实。
     """
+    return await run_in_threadpool(_get_task, request, task_id, service=service, error=error, processing_repository=processing_repository)
+
+
+def _get_task(request: Request, task_id: str, *, service: Service, error: ErrorFactory, processing_repository: ProcessingRepository) -> dict[str, object]:
+    """在同一工作线程读取任务及其图片摘要，返回公开详情。"""
     record = service(request, "tasks").get(task_id)
     if record is None:
         # 图片处理 job 与叶子 Task 使用不同控制面，但旧前端只知道统一的
@@ -260,6 +270,11 @@ async def cancel_task(
     已完成任务直接返回摘要；任务服务负责真正的状态转换，Agent 取消只作为可选适配
     能力按当前任务类型调用。
     """
+    return await run_in_threadpool(_cancel_task, request, task_id, service=service, error=error, processing_repository=processing_repository, cancel_agent=cancel_agent)
+
+
+def _cancel_task(request: Request, task_id: str, *, service: Service, error: ErrorFactory, processing_repository: ProcessingRepository, cancel_agent: CancelAgent | None) -> dict[str, object]:
+    """在线程内完成取消及结果查询，数据库和执行器等待不占用事件循环。"""
     tasks = service(request, "tasks")
     record = tasks.get(task_id)
     if record is None:
@@ -289,6 +304,11 @@ async def retry_task(
     task service 的稳定 RuntimeError code 映射为既有 HTTP 错误；未知诊断文本不直接
     暴露给客户端。
     """
+    return await run_in_threadpool(_retry_task, request, task_id, service=service, error=error, processing_repository=processing_repository)
+
+
+def _retry_task(request: Request, task_id: str, *, service: Service, error: ErrorFactory, processing_repository: ProcessingRepository) -> dict[str, object]:
+    """在线程内提交重试并返回任务摘要。"""
     try:
         record = service(request, "tasks").retry(task_id)
     except RuntimeError as exc:

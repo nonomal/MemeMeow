@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 from typing import Any
+import time
+
+from loguru import logger
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -37,7 +40,11 @@ class UnitOfWork:
             if exc_type:
                 self.session.rollback()
             else:
+                started = time.monotonic()
                 self.session.commit()
+                duration_ms = int((time.monotonic() - started) * 1000)
+                if duration_ms >= 100:
+                    logger.warning("db_commit_slow duration_ms={}", duration_ms)
         finally:
             self.session.close()
 

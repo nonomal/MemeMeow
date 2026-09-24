@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from backend.persistence.query_diagnostics import attach_query_diagnostics
 
 from backend.persistence.models import (
     Base,
@@ -50,6 +51,7 @@ def create_engine_for_url(url: str | None = None, **kwargs: Any) -> Engine:
         engine = create_engine(url or database_url_from_env(), pool_pre_ping=True, future=True, **kwargs)
     except SQLAlchemyError as exc:
         raise DatabaseError("database_engine_failed") from exc
+    attach_query_diagnostics(engine)
     return engine
 
 

@@ -542,16 +542,20 @@ class TaskRepository:
 
     def _ensure_lane_slots(self, lane: str, capacity: int) -> None:
         """幂等创建 lane 槽位；调用者必须先持有 lane advisory lock。"""
-        for number in range(max(1, int(capacity))):
-            if self.session.get(TaskLaneSlot, (lane, number)) is None:
+        capacity = max(1, int(capacity))
+        # 一次读取已有编号，缩短所有调度者共享的事务锁持有时间。
+        existing = set(self.session.scalars(select(TaskLaneSlot.slot_number).where(TaskLaneSlot.lane == lane, TaskLaneSlot.slot_number < capacity)))
+        for number in range(capacity):
+            if number not in existing:
                 self.session.add(TaskLaneSlot(lane=lane, slot_number=number))
         self.session.flush()
 
     def _ensure_lane_resource_slots(self, lane: str, resource_key: str, capacity: int) -> None:
         """幂等创建资源池槽位；调用者必须先持有同一 lane advisory lock。"""
-        for number in range(max(1, int(capacity))):
-            identity = (lane, resource_key, number)
-            if self.session.get(TaskLaneResourceSlot, identity) is None:
+        capacity = max(1, int(capacity))
+        existing = set(self.session.scalars(select(TaskLaneResourceSlot.slot_number).where(TaskLaneResourceSlot.lane == lane, TaskLaneResourceSlot.resource_key == resource_key, TaskLaneResourceSlot.slot_number < capacity)))
+        for number in range(capacity):
+            if number not in existing:
                 self.session.add(TaskLaneResourceSlot(lane=lane, resource_key=resource_key, slot_number=number))
         self.session.flush()
 

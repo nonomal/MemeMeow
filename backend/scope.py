@@ -14,6 +14,7 @@ from threading import RLock
 from typing import Any, Callable, Protocol, TYPE_CHECKING
 
 from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 
 from backend.database import ScopeContext, Task, utcnow
 
@@ -194,7 +195,8 @@ async def resolve_scope_async(request: Any) -> ScopeContext:
         method = _resolver_method(resolver)
         if method is None:
             raise ScopeResolutionError("scope resolver 不可调用")
-        value = method(request)
+        # 同步宿主解析可能访问数据库；整个调用在线程内完成其事务。
+        value = await method(request) if inspect.iscoroutinefunction(method) else await run_in_threadpool(method, request)
         if inspect.isawaitable(value):
             value = await value
         return _validate_scope(value)

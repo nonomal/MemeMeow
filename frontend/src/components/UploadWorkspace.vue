@@ -212,11 +212,11 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
   retryOptions.value = options
   preserveRetryOptions.value = true
   const selectedFiles = submitFiles.value
+  dialogOpen.value = false
   const outcome = await batch.start(selectedFiles, options, props.config)
   if (outcome.transportError) {
     // 传输异常的 message 可能来自后端 detail；这里只信任稳定错误码并使用固定文案。
     emit('error', uploadErrorMessage(outcome.transportError))
-    // 网络或服务错误时保持对话框和选择，用户可以直接再次确认。
     return
   }
   dialogOpen.value = false

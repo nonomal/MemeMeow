@@ -196,7 +196,7 @@ async def bind_request_scope(request: Request, call_next: Any) -> Any:
         factory = getattr(request.app.state, "service_factory", None)
         if factory is None or not callable(getattr(factory, "for_scope", None)):
             raise ScopeResolutionError("应用未配置 scope service factory")
-        services = validate_scope_services(scope, factory.for_scope(scope))
+        services = validate_scope_services(scope, await run_in_threadpool(factory.for_scope, scope))
         for extension in extension_list(request.app):
             await invoke_extension_hook(extension, "authorize_request", request, scope, services)
     except HTTPException as exc:
