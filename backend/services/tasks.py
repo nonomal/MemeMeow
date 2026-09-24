@@ -432,7 +432,7 @@ class PostgresTaskService:
         ``_prepare_visual_snapshot`` 可能为旧任务补齐模型、维度和预处理版本；这些
         字段属于同一业务输入，必须让首次 attempt 与后续 resume 使用完全相同的摘要。
         """
-        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+        stable_payload = {key: value for key, value in payload.items() if not key.startswith("_") and key != "agent_reservation_expires_at"}
         if snapshot is not None:
             query = snapshot.get("query")
             if isinstance(query, Mapping):
@@ -1117,10 +1117,11 @@ class PostgresTaskService:
             self._persist_claim_payload_updates(claim, {"agent_grant_key": logical_key})
         if operation_policy.uses_task_settlement:
             deadline = operation_policy.prepare_task(association.grant)
-            updates = {"agent_reservation_expires_at": deadline.isoformat()}
-            self._persist_claim_payload_updates(claim, updates)
-            payload.update(updates)
-            return
+            if deadline is not None:
+                updates = {"agent_reservation_expires_at": deadline.isoformat()}
+                self._persist_claim_payload_updates(claim, updates)
+                payload.update(updates)
+                return
         try:
             result = self._operation_policy.commit(association.grant)
         except OperationPolicyError:
@@ -1800,19 +1801,20 @@ class PostgresTaskService:
                     executor_attempt_id=executor_attempt_id,
                 )
             else:
-                # 只有当前 claim 仍有效时才写入任务终态和 Meme provenance。
-                self._image_attempt_state(claim, task_payload, "completed")
-                audit_result = self._with_reverse_image_audit(task_id, result, write_provenance=False)
-                try:
-                    self._fenced_success(task_id, generation, audit_result)
-                except DatabaseError as exc:
-                    if str(exc) != "agent_reservation_expired":
-                        raise
-                    self._fenced_failure(
-                        task_id, generation, message="额度预留已到期",
-                        error={"error": "agent_reservation_expired", "message": "额度预留已达到 24 小时"},
-                        retry=False,
-                    )
+                if not task_payload.get("_agent_context_settled"):
+                    # 只有当前 claim 仍有效时才写入任务终态和 Meme provenance。
+                    self._image_attempt_state(claim, task_payload, "completed")
+                    audit_result = self._with_reverse_image_audit(task_id, result, write_provenance=False)
+                    try:
+                        self._fenced_success(task_id, generation, audit_result)
+                    except DatabaseError as exc:
+                        if str(exc) != "agent_reservation_expired":
+                            raise
+                        self._fenced_failure(
+                            task_id, generation, message="额度预留已到期",
+                            error={"error": "agent_reservation_expired", "message": "额度预留已达到 24 小时"},
+                            retry=False,
+                        )
             finally:
                 heartbeat_stop.set()
             self._maybe_finalize(task_id)

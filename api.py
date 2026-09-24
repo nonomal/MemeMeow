@@ -27,6 +27,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import select
+from contextlib import nullcontext
+from sqlalchemy.orm import Session
 
 from backend.config import Settings, validate_agent_concurrency
 from backend.collection_packages import (
@@ -399,13 +401,15 @@ def _invalidate_stale_text_embeddings(
     meme_id: str | UUID,
     image_sha256: str,
     metadata_hash: str,
+    session: Session | None = None,
 ) -> None:
     """把指定图片旧 metadata hash 的 ready 文本向量标记为失效。
 
     standalone 图片阶段只负责当前叶子任务的事实收束，不能创建新的文本任务；
     其成功改变图片语境或路径后，由该辅助函数让旧向量退出检索候选。
     """
-    with database.factory() as session:
+    owns_session = session is None
+    with database.factory() if owns_session else nullcontext(session) as session:
         stale_rows = list(
             session.scalars(
                 select(MemeTextEmbedding).where(
@@ -420,7 +424,8 @@ def _invalidate_stale_text_embeddings(
         for stale in stale_rows:
             stale.status = "failed"
             stale.updated_at = utcnow()
-        session.commit()
+        if owns_session:
+            session.commit()
 
 
 def _context_payload(request: Request, image: Path, *, auto_name: bool = False, batch_id: str | None = None, expected_sha256: str | None = None, reverse_image_policy: str = "forbid") -> dict[str, object]:
@@ -983,6 +988,36 @@ async def lifespan(app: FastAPI):
         claim = None
         if isinstance(payload.get("_claim_task_id"), str) and isinstance(payload.get("_claim_generation"), int) and isinstance(payload.get("_claim_owner"), str):
             claim = (str(payload["_claim_task_id"]), int(payload["_claim_generation"]), str(payload["_claim_owner"]))
+        settled_result: dict[str, object] = {}
+
+        def settle_saved_context(environment, record) -> None:
+            """在语境写入事务内更新向量状态、Task 成功结果和宿主计量。"""
+            settled_result.update({
+                "image_relative_path": relative,
+                "meme_id": meme_id,
+                "session_id": session_id,
+                "result_artifact": f"task-results/{claim[0]}/result.json.tmp",
+                "reverse_image_policy": payload["reverse_image_policy"],
+                "metadata_hash": record.search_metadata_hash,
+                "network_reverse_image_search": {
+                    "policy": payload["reverse_image_policy"],
+                    **environment.reverse_image_usage.aggregate_task(claim[0]),
+                },
+            })
+            snapshot = payload.get("_visual_match_snapshot")
+            if isinstance(snapshot, Mapping):
+                settled_result["visual_match_snapshot"] = visual_match_snapshot_summary(snapshot)
+            if mode == "standalone":
+                _invalidate_stale_text_embeddings(
+                    app.state.database, scope_id=service.scope.scope_id,
+                    meme_id=meme_id, image_sha256=expected_sha,
+                    metadata_hash=record.search_metadata_hash, session=environment.uow.session,
+                )
+            if not environment.tasks.complete_fenced_with_provenance(*claim, result=settled_result):
+                raise MetadataError("claim_expired")
+            gateway.settle_task(environment.uow.session, service.scope, claim[0])
+
+        settle_with_context = gateway is not None and gateway.uses_task_settlement and payload.get("agent_reservation_expires_at") is not None
         try:
             metadata = service.metadata.update_context(
                 image,
@@ -993,6 +1028,7 @@ async def lifespan(app: FastAPI):
                 error=None,
                 expected_sha256=expected_sha,
                 claim=claim,
+                on_saved=settle_saved_context if settle_with_context else None,
                 agent_context={
                     "task_id": str(payload.get("_claim_task_id") or ""),
                     "image_sha256": expected_sha,
@@ -1004,14 +1040,20 @@ async def lifespan(app: FastAPI):
                 },
             )
         except MetadataError as exc:
+            if exc.code in {"agent_reservation_expired", "agent_reservation_deadline_invalid"}:
+                raise RuntimeError(exc.code) from exc
             if exc.code == "claim_expired":
                 raise RuntimeError("target_changed") from exc
             raise RuntimeError("agent_output_schema_invalid") from exc
+        if settle_with_context:
+            payload["_agent_context_settled"] = True
         mark_invalidated = getattr(service.search, "mark_cache_invalidated", None)
         if mark_invalidated:
             mark_invalidated(payload.get("batch_id"))
         else:
             service.search.invalidate_cache()
+        if settle_with_context:
+            return settled_result
         result: dict[str, object] = {
             "image_relative_path": relative,
             "meme_id": meme_id,

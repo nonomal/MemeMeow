@@ -6,6 +6,7 @@ import pytest
 
 from backend.persistence.engine import DatabaseError
 from backend.task_deadline import ensure_task_deadline
+from backend.services.tasks import PostgresTaskService
 
 
 def test_reservation_deadline_boundary() -> None:
@@ -37,3 +38,13 @@ def test_reservation_deadline_requires_timezone() -> None:
 def test_task_without_reservation_deadline() -> None:
     """没有宿主预留期限的任务可以使用原有执行条件。"""
     ensure_task_deadline({}, datetime.now(timezone.utc))
+
+
+def test_reservation_deadline_preserves_resume_input_digest() -> None:
+    """执行准备阶段补充预留期限后，自动续跑仍识别同一业务输入。"""
+    payload = {"meme_id": "test-image", "image_sha256": "a" * 64}
+    before = PostgresTaskService._image_attempt_input_digest(payload)
+    after = PostgresTaskService._image_attempt_input_digest({
+        **payload, "agent_reservation_expires_at": "2026-09-25T00:00:00+00:00",
+    })
+    assert before == after

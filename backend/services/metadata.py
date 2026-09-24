@@ -7,8 +7,10 @@ import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID, uuid4
+
+from sqlalchemy import select
 
 from backend.persistence.models import (
     EMBEDDING_DIMENSIONS,
@@ -24,7 +26,7 @@ from backend.persistence.models import (
     TaskLaneSlot,
 )
 from backend.persistence.engine import DatabaseError
-from backend.persistence.resources import DatabaseResources
+from backend.persistence.resources import DataEnvironment, DatabaseResources
 from backend.persistence.storage import StorageCoordinator
 from backend.persistence.models import utcnow
 from backend.image_naming import content_addressed_key, normalize_extension, saved_filename
@@ -368,12 +370,15 @@ class PostgresMetadataService:
         extensions = {key: value for key, value in current.model_dump(mode="json", exclude_none=False).items() if key not in known}
         return context, provenance, extensions
 
-    def update_context(self, image: Path, context_updates: dict[str, object], *, producer: str, model: str | None = None, status: str = "partial", error: str | None = None, expected_revision: int | None = None, expected_sha256: str | None = None, claim: tuple[str, int, str] | None = None, agent_context: dict[str, object] | None = None) -> SidecarMetadata:
-        """校验文件后按已有记录 ID 更新语境，保留 revision/SHA 与任务条件。"""
+    def update_context(self, image: Path, context_updates: dict[str, object], *, producer: str, model: str | None = None, status: str = "partial", error: str | None = None, expected_revision: int | None = None, expected_sha256: str | None = None, claim: tuple[str, int, str] | None = None, agent_context: dict[str, object] | None = None, on_saved: Callable[[DataEnvironment, Meme], None] | None = None) -> SidecarMetadata:
+        """校验文件并更新语境；on_saved 在同一事务内完成相关任务写入。"""
         key = self._relative(image)
         snapshot = self._record(image)
         identity = self._identity(image)
         with self.resources.environment(self.scope.scope_id) as environment:
+            if claim is not None:
+                # 与任务成功及取消统一采用 Task、Meme 的锁定顺序。
+                environment.uow.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == claim[0]).with_for_update())
             record = environment.memes.get(snapshot.id, for_update=True)
             if record is None:
                 raise MetadataError("metadata_missing")
@@ -386,6 +391,8 @@ class PostgresMetadataService:
             except DatabaseError as exc:
                 raise MetadataError(exc.code) from exc
             record.extensions = extensions
+            if on_saved is not None:
+                on_saved(environment, record)
             return self._to_sidecar(record)
 
     def record_error(self, image: Path, *, producer: str, model: str | None, error: str) -> SidecarMetadata:

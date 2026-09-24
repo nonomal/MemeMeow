@@ -408,9 +408,11 @@ class OperationPolicyGateway:
         """宿主提供任务结算扩展时，由任务终态决定 Agent 计量。"""
         return callable(getattr(self.policy, "settle_task", None))
 
-    def prepare_task(self, grant: GrantRef) -> datetime:
+    def prepare_task(self, grant: GrantRef) -> datetime | None:
         """取得宿主预留的固定截止时间，供 Worker 保存到可信任务字段。"""
         deadline = self.policy.prepare_task(grant)
+        if deadline is None:
+            return None
         if not isinstance(deadline, datetime) or deadline.tzinfo is None:
             raise OperationPolicyError("agent_reservation_deadline_invalid")
         return deadline
