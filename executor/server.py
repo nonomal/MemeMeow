@@ -1292,6 +1292,7 @@ class Executor:
         return (
             "使用 research-meme-context skill 分析这张表情包；先读取本任务固定候选 manifest，"
             "候选只作为参考证据；只通过项目内部接口使用可选反向图片能力。"
+            "必须直接通过视觉模型查看输入图片并识别图片文字，禁止调用任何本地文字识别程序、命令或脚本。"
             f"本任务 reverse_image_policy={task.reverse_image_policy}。"
             f"{resume_instruction}"
             f"结果必须写入 {result_dir / RESULT_FILE_NAME}；先写 {result_dir / RESULT_DRAFT_NAME}，"

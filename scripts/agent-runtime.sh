@@ -38,7 +38,7 @@ case "${1:-check}" in
     ;;
   check)
     compose ps "$SERVICE"
-    compose exec -T "$SERVICE" sh -lc 'set -eu; id; opencode --version; node --version; python3 --version; file --version | head -1; convert --version | head -1; tesseract --version | head -1; jq --version; curl --version | head -1; test "$(id -u)" != 0; test -r /images && test ! -w /images; test -r /skills/research-meme-context && test ! -w /skills/research-meme-context; test -r /opt/mememeow/node_modules && test ! -w /opt/mememeow/node_modules; test -r /runtime && test -w /runtime; test ! -S /var/run/docker.sock; test ! -e /.env; python3 -m executor.probe; printf "agent runtime probe: ok\n"'
+    compose exec -T "$SERVICE" sh -lc 'set -eu; id; opencode --version; node --version; python3 --version; file --version | head -1; convert --version | head -1; jq --version; curl --version | head -1; if command -v tesseract >/dev/null 2>&1; then printf "agent runtime forbidden tool present: tesseract\n" >&2; exit 1; fi; test "$(id -u)" != 0; test -r /images && test ! -w /images; test -r /skills/research-meme-context && test ! -w /skills/research-meme-context; test -r /opt/mememeow/node_modules && test ! -w /opt/mememeow/node_modules; test -r /runtime && test -w /runtime; test ! -S /var/run/docker.sock; test ! -e /.env; python3 -m executor.probe; printf "agent runtime probe: ok\n"'
     ;;
   stop)
     compose stop "$SERVICE"

@@ -17,7 +17,7 @@
 ## 2. Agent 执行器 (Executor) 与安全边界
 
 ### 镜像与挂载
-镜像位于 `docker/agent/Dockerfile`，预装 OpenCode、Node、Python、Bash、curl、jq、file、ImageMagick、ffmpeg、Tesseract 中英文 OCR 和常见文本工具。
+镜像位于 `docker/agent/Dockerfile`，预装 OpenCode、Node、Python、Bash、curl、jq、file、ImageMagick、ffmpeg 和常见文本工具。Agent 通过视觉模型直接识别图片文字，容器中不提供本地 OCR 命令。
 - 镜像默认用户本身是非 root；Compose 会以部署提供的 UID/GID 覆盖运行身份。
 - 入口是固定的 `executor.server` HTTP 服务。
 - 只读挂载 `data/images` 和 `skills/research-meme-context`。

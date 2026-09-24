@@ -6,7 +6,6 @@ WORKDIR /opt/mememeow
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl file jq \
     imagemagick ffmpeg \
-    tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim tesseract-ocr-chi-tra \
     python3 python3-pip python3-venv python3-dotenv \
     git unzip zip procps findutils grep sed gawk \
     && rm -rf /var/lib/apt/lists/*

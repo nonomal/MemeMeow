@@ -21,23 +21,18 @@
 
 | 工具 | 用途 | Ubuntu 包 |
 |---|---|---|
-| `tesseract` | 在 VLM 不可用或 OCR 有争议时进行本地文字识别 | `tesseract-ocr` 及所需语言包 |
 | `exiftool` | 检查或移除上传前图片的 EXIF 元数据 | `libimage-exiftool-perl` |
-
-中文、日文、韩文和英文常用 OCR 语言包为 `tesseract-ocr-chi-sim`、`tesseract-ocr-chi-tra`、`tesseract-ocr-jpn`、`tesseract-ocr-kor`、`tesseract-ocr-eng`。
 
 ## 安装与检查
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y jq imagemagick tesseract-ocr \
-  tesseract-ocr-eng tesseract-ocr-chi-sim tesseract-ocr-chi-tra \
-  tesseract-ocr-jpn tesseract-ocr-kor libimage-exiftool-perl
+sudo apt-get install -y jq imagemagick libimage-exiftool-perl
 
-for tool in curl jq file identify ffmpeg tesseract exiftool; do
+for tool in curl jq file identify ffmpeg exiftool; do
   command -v "$tool" >/dev/null && printf '%s: ok\n' "$tool" || printf '%s: missing\n' "$tool"
 done
 command -v magick >/dev/null && printf 'magick: ok\n' || command -v convert >/dev/null && printf 'convert: ok\n' || printf 'ImageMagick: missing\n'
 ```
 
-Ubuntu 22.04 通常安装 ImageMagick 6，命令为 `convert`；ImageMagick 7 才通常提供 `magick`。项目已使用 Python、Pillow 与 `uv`；不需要为本 Skill 另行安装 Node HTTP 库、Python `requests`、Playwright 或浏览器。只有要处理动画媒体时才需要 `ffmpeg`，只有要做本地 OCR 时才需要 Tesseract。
+Ubuntu 22.04 通常安装 ImageMagick 6，命令为 `convert`；ImageMagick 7 才通常提供 `magick`。项目已使用 Python、Pillow 与 `uv`；不需要为本 Skill 另行安装 Node HTTP 库、Python `requests`、Playwright 或浏览器。Agent 通过视觉模型直接识别图片文字，不使用本地文字识别命令。

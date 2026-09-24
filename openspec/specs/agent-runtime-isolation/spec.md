@@ -22,11 +22,11 @@
 - **THEN** 容器中不存在可用的宿主 Docker socket
 
 ### Requirement: Agent 容器必须保留研究所需的通用能力
-系统 MUST 在 Agent 镜像中提供 OpenCode、Node 运行时、Python、图像格式识别与转换、OCR、JSON 处理、HTTP 客户端和常见文本处理工具。容器 MUST 允许网络访问和 Bash 工具调用。
+系统 MUST 在 Agent 镜像中提供 OpenCode、Node 运行时、Python、图像格式识别与转换、JSON 处理、HTTP 客户端和常见文本处理工具。Agent MUST 通过视觉模型直接识别输入图片中的文字，容器 MUST 不提供本地 OCR 命令。容器 MUST 允许网络访问和 Bash 工具调用。
 
-#### Scenario: Agent 对小尺寸图片执行 OCR
+#### Scenario: Agent 通过视觉模型识别图片文字
 - **WHEN** Agent 需要识别图片中的小尺寸文字
-- **THEN** 它可以在容器中运行图像处理和 OCR 工具，并读取结果
+- **THEN** 它直接查看输入图片并将识别到的原始文字写入结果，容器中不存在本地 OCR 命令
 
 ### Requirement: Agent 模型连接配置必须只经运行环境提供
 系统 MUST 仅向 Agent 容器传入模型 Base URL 和 API Key 所需的运行环境变量，不得将宿主 `.env` 或其他宿主机凭据目录挂载进容器。
