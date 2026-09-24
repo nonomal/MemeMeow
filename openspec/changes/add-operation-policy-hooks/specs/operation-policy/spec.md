@@ -20,7 +20,7 @@
 
 ### Requirement: 策略必须区分查询、取得执行权和计量终态
 
-系统 MUST 提供非权威的 `probe` 查询以及权威的 `acquire`、`commit`、`release` 生命周期。`probe` MUST NOT 预占或消耗 operation 使用权，真实副作用前 MUST 再次执行 `acquire`。同一幂等键的 acquire、commit 和 release MUST 可安全重复处理；只有能够确定外部副作用尚未发生时才允许 release。策略永久禁止、operation 限制和策略不可用 MUST 分别使用 `operation_forbidden`、`operation_limit_exceeded` 和 `operation_policy_unavailable` 终止被策略控制的 operation，不得继续该 operation 的副作用。父工作流是否失败或降级 MUST 由对应 capability 明确定义；其中 `analysis.reverse_image_search` 在任务策略为 `auto` 且仅因 operation policy 拒绝时，MUST 不调用 provider，但 MUST 返回可降级结果并允许 Agent 继续离线分析。policy 拒绝结果可以包含可选 `retry_at`；核心 MUST NOT 计算限制周期，也 MUST NOT 因到达该时间自动重新执行。
+系统 MUST 提供非权威的 `probe` 查询以及权威的 `acquire`、`commit`、`release` 生命周期。`probe` MUST NOT 预占或消耗 operation 使用权，真实副作用前 MUST 再次执行 `acquire`。同一幂等键的 acquire、commit 和 release MUST 可安全重复处理。默认计量模式只有能够确定外部副作用尚未发生时才允许 release；宿主选择 Agent 任务结果结算时，MUST 根据持久化任务终态完成计量。策略永久禁止、operation 限制和策略不可用 MUST 分别使用 `operation_forbidden`、`operation_limit_exceeded` 和 `operation_policy_unavailable` 终止被策略控制的 operation，不得继续该 operation 的副作用。父工作流是否失败或降级 MUST 由对应 capability 明确定义；其中 `analysis.reverse_image_search` 在任务策略为 `auto` 且仅因 operation policy 拒绝时，MUST 不调用 provider，但 MUST 返回可降级结果并允许 Agent 继续离线分析。policy 拒绝结果可以包含可选 `retry_at`；核心 MUST NOT 计算限制周期，也 MUST NOT 因到达该时间自动重新执行。
 
 #### Scenario: 查询后额度被并发请求占用
 - **WHEN** 两个请求先后 probe 得到可用，但只有一个请求能原子 acquire 最后一个名额
@@ -77,7 +77,13 @@
 
 ### Requirement: Agent 策略必须绑定逻辑分析任务
 
-系统 MUST 由图片处理 Worker 在确认当前图片没有有效 Agent 语境、且活动 `meme_context_generation` Task dedupe 完成之后，为新的逻辑 Agent Task acquire 一次 `analysis.agent`。系统 MUST 使用服务端预生成 task id 或等价稳定 `logical_request_key` 保证并发 acquire 幂等，并把 grant 与持久 Agent Task 可信关联；grant 不得绑定 execution attempt，也不得从客户端 payload 接受或覆盖。同一 Agent Task 的 Worker 自动重试、租约恢复、claim 变化和终态写回 MUST 复用原 grant，不重复计量；用户主动重试终态图片处理 job MUST 创建新 job revision 和新 Agent Task 并重新 acquire。Agent 外部执行开始前 MUST commit；只有尚未开始且确定无副作用的 reservation 才允许 release。每个 attempt MUST 关联该 Task 并持久化准备、grant 已提交、外部调用已开始、完成或未知执行状态；外部调用已开始后结果未知时 MUST 保留计量事实、让 Task 以稳定错误收束并禁止自动重放。
+系统 MUST 由图片处理 Worker 在确认当前图片没有有效 Agent 语境、且活动 `meme_context_generation` Task dedupe 完成之后，为新的逻辑 Agent Task acquire 一次 `analysis.agent`。系统 MUST 使用服务端预生成 task id 或等价稳定 `logical_request_key` 保证并发 acquire 幂等，并把 grant 与持久 Agent Task 可信关联；grant 不得绑定 execution attempt，也不得从客户端 payload 接受或覆盖。同一 Agent Task 的 Worker 自动重试、租约恢复、claim 变化和终态写回 MUST 复用原 grant，不重复计量；用户主动重试终态图片处理 job MUST 创建新 job revision 和新 Agent Task 并重新 acquire。默认计量模式 MUST 在 Agent 外部执行开始前 commit，且只有尚未开始并确定无副作用的 reservation 才允许 release。宿主 MAY 通过 `prepare_task` 和 `settle_task` 启用任务结果结算；核心 MUST 保存宿主提供的绝对期限，在同一个 Session 和事务内保存有效语境、Task 成功状态并调用宿主结算。最终失败 MUST 在任务状态事务内调用宿主结算；自动重试 MUST 复用原 grant 和期限。每个 attempt MUST 关联该 Task 并持久化实际发生的准备、计量提交、外部调用开始、完成或未知执行状态；外部调用已开始后结果未知时 MUST 让 Task 以稳定错误收束并禁止自动重放。
+
+#### Scenario: 宿主按任务结果结算
+- **WHEN** 宿主提供任务结果结算和绝对预留期限
+- **THEN** 核心在执行期间保留原 grant，在语境成功保存的事务内完成任务及结算
+- **AND** 已到期限或失去有效 claim 的任务不能保存语境或提交成功
+- **AND** 自动重试不延长期限，宿主根据最终失败状态释放预留
 
 #### Scenario: 有效语境或活动任务去重
 - **WHEN** 相同图片内容和 Agent 配置已有有效语境，或已有活动 `meme_context_generation` Task
