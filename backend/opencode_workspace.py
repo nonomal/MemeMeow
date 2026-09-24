@@ -289,18 +289,28 @@ def _containment(path: Path, root: Path, *, code: str) -> None:
 
 def build_external_directory_rules(workspace: ResolvedWorkspace) -> tuple[tuple[str, str], ...]:
     """生成 catch-all deny 后的精确只读输入和受控写入规则。"""
+    def directory(path: Path) -> str:
+        """返回 OpenCode 外部目录自身的绝对路径规则。"""
+        return Path(os.path.abspath(path)).as_posix()
+
     def subtree(path: Path) -> str:
         """返回 OpenCode 外部目录 glob，保持绝对路径来自 provider。"""
-        return f"{Path(os.path.abspath(path)).as_posix()}/**"
+        return f"{directory(path)}/**"
 
-    result_directory = Path(os.path.abspath(workspace.task_results_root)).as_posix()
+    result_directory = directory(workspace.task_results_root)
     return (
         ("*", "deny"),
+        (directory(workspace.skill_root), "allow"),
         (subtree(workspace.skill_root), "allow"),
+        (directory(workspace.images_root), "allow"),
         (subtree(workspace.images_root), "allow"),
+        (directory(workspace.metadata_root), "allow"),
         (subtree(workspace.metadata_root), "allow"),
+        (directory(workspace.candidate_root), "allow"),
         (subtree(workspace.candidate_root), "allow"),
+        (directory(workspace.task_scratch_root), "allow"),
         (subtree(workspace.task_scratch_root), "allow"),
+        (directory(workspace.task_results_root), "allow"),
         # OpenCode 对外部文件先请求其父目录 ``<dir>/*``；仅写两个精确文件
         # 规则无法允许首次创建，因此这里只放行当前 Task 结果目录的父级检查，
         # 实际可写文件由 ``edit`` 规则继续收窄。

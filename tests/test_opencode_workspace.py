@@ -49,7 +49,11 @@ def test_external_selectors_share_db_but_not_workspace_paths(tmp_path: Path) -> 
     assert first.candidate_root == root / "scope-a" / "candidates" / "task-a"
     assert not first.candidate_root.exists()
     assert dict(first.permission_rules)["*"] == "deny"
+    assert dict(first.permission_rules)[f"{first.candidate_root.absolute()}"] == "allow"
     assert dict(first.permission_rules)[f"{first.candidate_root.absolute()}/**"] == "allow"
+    assert dict(first.permission_rules)[f"{first.task_scratch_root.absolute()}"] == "allow"
+    assert dict(first.permission_rules)[f"{first.task_scratch_root.absolute()}/**"] == "allow"
+    assert dict(first.permission_rules)[f"{first.task_results_root.absolute()}"] == "allow"
     assert dict(first.permission_rules)[f"{first.task_results_root.absolute()}/*"] == "allow"
     edit_rules = dict(
         build_edit_permission_rules(
@@ -84,6 +88,8 @@ def test_workspace_config_separates_external_access_from_edit_access(tmp_path: P
     config = _workspace_opencode_config(workspace)
     external = config["permission"]["external_directory"]
     edit = config["permission"]["edit"]
+    assert external[str(workspace.skill_root.absolute())] == "allow"
+    assert external[str(workspace.task_scratch_root.absolute())] == "allow"
     assert external[f"{workspace.task_results_root.absolute()}/*"] == "allow"
     assert edit["*"] == "deny"
     assert edit[f"**/{workspace.draft_path.as_posix().lstrip('/')}"] == "allow"
