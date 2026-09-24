@@ -1,10 +1,11 @@
 <script setup lang="ts">
 /** 上传工作区：管理文件选择、选项确认与逐文件结果。 */
-import { computed, onMounted, onUnmounted, shallowRef } from 'vue'
+import { computed, onMounted, onUnmounted, shallowRef, watch } from 'vue'
 import type { ImageProcessingOptions, ServiceConfig } from '../types'
 import { uploadErrorMessage } from '../utils/presentation'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import UploadPendingItem from './UploadPendingItem.vue'
+import UploadTaskHistory from './UploadTaskHistory.vue'
 import { useUploadBatch, type UploadBatchItem } from '../composables/useUploadBatch'
 
 const props = defineProps<{
@@ -22,6 +23,8 @@ const dialogTrigger = shallowRef<HTMLElement | null>(null)
 const retryOptions = shallowRef<ImageProcessingOptions>({ reverse_image_policy: 'forbid', auto_name: false })
 const preserveRetryOptions = shallowRef(false)
 const batch = useUploadBatch()
+const taskHistory = shallowRef<InstanceType<typeof UploadTaskHistory> | null>(null)
+watch(() => batch.summary.value.accepted, () => { void taskHistory.value?.refresh() })
 const batchItems = batch.items
 const batchSummary = batch.summary
 const submitFiles = batch.submittableFiles
@@ -214,6 +217,7 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
   const selectedFiles = submitFiles.value
   dialogOpen.value = false
   const outcome = await batch.start(selectedFiles, options, props.config)
+  await taskHistory.value?.refresh()
   if (outcome.transportError) {
     // 传输异常的 message 可能来自后端 detail；这里只信任稳定错误码并使用固定文案。
     emit('error', uploadErrorMessage(outcome.transportError))
@@ -226,8 +230,9 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
 
 /** 返回不依赖后端枚举原文的逐项状态文案。 */
 function statusLabel(item: UploadBatchItem): string {
+  if (item.status === 'accepted') return '已接收，后台处理中'
   if (item.status === 'succeeded') return '完成'
-  if (item.status === 'uploading') return '上传中'
+  if (item.status === 'uploading') return item.progress >= 1 ? '传输完成，等待接收确认' : `传输中 ${Math.floor(item.progress * 100)}%`
   if (item.status === 'pending') return '等待中'
   if (item.status === 'cancelled') return '已取消'
   return item.error === 'rate_limited' ? '等待重试' : '失败'
@@ -263,8 +268,8 @@ function itemDetail(item: UploadBatchItem): string {
         {{ busy ? '上传中...' : '上传所选图片' }}
       </button>
       <div v-if="batchSummary.total" class="upload-summary" aria-live="polite">
-        <strong>已处理 {{ batchSummary.succeeded + batchSummary.failed + batchSummary.cancelled }} / {{ batchSummary.total }}</strong>
-        <span>成功 {{ batchSummary.succeeded }}，失败 {{ batchSummary.failed }}，取消 {{ batchSummary.cancelled }}</span>
+        <strong>本次已接收 {{ batchSummary.accepted }} / {{ batchSummary.total }}</strong>
+        <span>传输失败 {{ batchSummary.failed }}，取消 {{ batchSummary.cancelled }}</span>
         <span v-if="batchSummary.pending" class="summary-muted">等待 {{ batchSummary.pending }}</span>
         <button v-if="busy && !paused" class="quiet" type="button" @click="batch.pause">暂停</button>
         <button v-if="busy && paused" class="quiet" type="button" @click="batch.resume">继续</button>
@@ -274,14 +279,14 @@ function itemDetail(item: UploadBatchItem): string {
     </div>
     <div v-if="batchItems.length" class="upload-results" aria-live="polite">
       <!-- 单次遍历让待上传项与活动结果始终保持原始拖放顺序。 -->
-      <template v-for="item in batchItems" :key="item.id" v-memo="[busy, item.file, item.status, item.error, item.file.name, item.result?.meme_id, item.result?.processing_status, item.result?.saved_filename, item.result?.processing_job_id, item.result?.metadata_job_id]">
+      <template v-for="item in batchItems" :key="item.id" v-memo="[busy, item.file, item.status, item.progress, item.error, item.file.name, item.result?.meme_id, item.result?.processing_status, item.result?.saved_filename, item.result?.processing_job_id, item.result?.metadata_job_id]">
         <UploadPendingItem
           v-if="item.status === 'pending'"
           :item="item"
           :removable="!busy"
           @remove="batch.removePending"
         />
-        <div v-else class="upload-result" :class="{ fail: item.status === 'failed' || item.status === 'cancelled' }">
+        <div v-else-if="item.status !== 'accepted'" class="upload-result" :class="{ fail: item.status === 'failed' || item.status === 'cancelled' }">
           <span>{{ statusLabel(item) }}</span>
           <strong :title="item.file.name">{{ item.file.name }}</strong>
           <button v-if="item.result?.processing_job_id || item.result?.metadata_job_id" class="quiet" type="button" @click="emit('openTask', item.result?.processing_job_id || item.result?.metadata_job_id || '')">查看任务</button>
@@ -289,6 +294,7 @@ function itemDetail(item: UploadBatchItem): string {
         </div>
       </template>
     </div>
+    <UploadTaskHistory ref="taskHistory" />
   </section>
 
   <ImageProcessingOptionsDialog

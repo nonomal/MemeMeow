@@ -213,7 +213,16 @@ async def list_tasks(
         """在线程内完成数据库读取与摘要生成，释放事件循环。"""
         records, next_cursor = service(request, "tasks").list(statuses=set(status) or None, task_types=set(task_type) or None, cursor=cursor, limit=limit)
         activities = read_agent_activity(request, records)
-        return {"items": [task_summary(request, record, activities, service=service, processing_repository=processing_repository) for record in records], "next_cursor": next_cursor}
+        targets = [(record.result["meme_id"], record.result["image_sha256"]) for record in records if record.task_type == "image_upload" and record.result and record.result.get("meme_id") and record.result.get("image_sha256")]
+        snapshots = processing_repository(request).latest_for_targets(targets) if targets else {}
+        latest = {str(identifier): snapshot.as_dict() for identifier, snapshot in snapshots.items()}
+        items = []
+        for record in records:
+            item = task_summary(request, record, activities, service=service, processing_repository=processing_repository)
+            if record.task_type == "image_upload":
+                item["processing"] = latest.get(str((record.result or {}).get("meme_id")))
+            items.append(item)
+        return {"items": items, "next_cursor": next_cursor}
 
     return await run_in_threadpool(read_page)
 

@@ -96,6 +96,7 @@ class PostgresTaskWorkerManager:
         self._stopped = Event()
         self._started = False
         self._recovery_thread: Thread | None = None
+        self._maintenance: list[Callable[[], None]] = []
         self._scheduled: set[str] = set()
         self.owner = f"worker-{os.getpid()}-{id(self)}"
 
@@ -170,8 +171,14 @@ class PostgresTaskWorkerManager:
             try:
                 self._recover_expired()
                 self._schedule_queued()
+                for maintain in self._maintenance:
+                    maintain()
             except Exception as exc:
                 diagnostic_logger.exception("task_recovery_error error_type={}", type(exc).__name__)
+
+    def register_maintenance(self, callback: Callable[[], None]) -> None:
+        """注册短时持久任务维护操作，与恢复线程共用生命周期。"""
+        self._maintenance.append(callback)
 
     def _recover_expired(self) -> list[str]:
         """跨所有 scope 恢复过期 claim，并释放旧 lane 槽位。"""

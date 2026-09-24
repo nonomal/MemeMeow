@@ -38,6 +38,16 @@ from backend.public_dto import (
 
 TERMINAL = {"succeeded", "failed"}
 STABLE_TASK_ERRORS = {
+    "upload_receipt_missing",
+    "upload_receiving_interrupted",
+    "upload_input_size_changed",
+    "upload_input_expired",
+    "upload_pending_capacity_exceeded",
+    "upload_disk_capacity_exceeded",
+    "upload_request_conflict",
+    "image_exists",
+    "invalid_image",
+    "unsupported_format",
     "no_indexable_images",
     "opencode_not_configured",
     "agent_process_failed",
@@ -304,6 +314,8 @@ class TaskRecord:
             "visual_match_snapshot": visual_snapshot,
         }
         # slot 是调度器内部事实，不属于任务公开契约；旧调用方仍可从内部对象读取。
+        if task_type == "image_upload":
+            result["upload"] = sanitize_task_result(task_type, self.payload)
         if include_payload:
             result["payload"] = self.payload
             result["lane_resource_key"] = self.lane_resource_key

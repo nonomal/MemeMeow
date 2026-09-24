@@ -1,4 +1,5 @@
 /** 统一封装后端请求、错误结构和任务轮询。 */
+import { uploadTransport } from './uploadTransport'
 const API_BASE = import.meta.env.VITE_API_BASE ?? (import.meta.env.DEV ? '/api' : '')
 const REPOSITORY_API_BASE = 'https://api.github.com/repos/MemeMeow-Studio/MemeMeow'
 const REPOSITORY_REQUEST_TIMEOUT_MS = 8_000
@@ -93,10 +94,11 @@ export const api = {
       ? { reverse_image_policy: 'forbid', auto_name: options }
       : normalizeImageProcessingOptions(options)
     const body = new FormData()
+    body.append('request_id', requestOptions.requestId || crypto.randomUUID())
     body.append('reverse_image_policy', normalized.reverse_image_policy)
     body.append('auto_name', String(normalized.auto_name))
     files.forEach((file) => body.append('files', file))
-    return request('/images/upload', { method: 'POST', body, signal: requestOptions.signal })
+    return uploadTransport(`${API_BASE}/images/upload`, body, requestOptions)
   },
   context: (payload) => request('/images/context', { method: 'POST', body: JSON.stringify(payload) }),
   contextBatch: (payload = {}) => request('/images/context/batch', { method: 'POST', body: JSON.stringify(payload) }),
@@ -110,6 +112,7 @@ export const api = {
   imageStage: (payload) => request('/images/stages', { method: 'POST', body: JSON.stringify(payload) }),
   task: (id) => request(`/tasks/${id}`),
   retryTask: (id) => request(`/tasks/${encodeURIComponent(id)}/retry`, { method: 'POST' }),
+  cancelTask: (id) => request(`/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   tasks: (params = {}) => request(`/tasks?${new URLSearchParams(Object.entries(params).filter(([, value]) => value !== undefined && value !== ''))}`),
   generateCache: () => request('/generate-cache', { method: 'POST' }),
   collections: (params = {}) => request(`/collections?${new URLSearchParams(params)}`),

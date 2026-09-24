@@ -9,7 +9,7 @@ import { computed, getCurrentInstance, onUnmounted, shallowRef } from 'vue'
 import { api } from '../api'
 import type { ImageProcessingOptions, ServiceConfig, UploadResult } from '../types'
 
-export type UploadItemStatus = 'pending' | 'uploading' | 'succeeded' | 'failed' | 'cancelled'
+export type UploadItemStatus = 'pending' | 'uploading' | 'accepted' | 'succeeded' | 'failed' | 'cancelled'
 
 export interface UploadBatchItem {
   id: string
@@ -19,6 +19,9 @@ export interface UploadBatchItem {
   error?: string
   retryable: boolean
   attempts: number
+  requestId: string
+  options?: ImageProcessingOptions
+  progress: number
 }
 
 export interface UploadBatchSummary {
@@ -28,6 +31,7 @@ export interface UploadBatchSummary {
   cancelled: number
   pending: number
   uploading: number
+  accepted: number
 }
 
 export interface UploadBatchRunResult {
@@ -35,6 +39,7 @@ export interface UploadBatchRunResult {
 }
 
 interface UploadChunk {
+  requestId: string
   items: UploadBatchItem[]
   retryCount: number
 }
@@ -134,7 +139,7 @@ export function useUploadBatch() {
 
   /** 创建等待上传的批次项，保留每一次传入 File 的独立身份。 */
   function createPendingItem(file: File): UploadBatchItem {
-    return { id: nextItemId(), file, status: 'pending', retryable: true, attempts: 0 }
+    return { id: nextItemId(), file, status: 'pending', retryable: true, attempts: 0, requestId: crypto.randomUUID(), progress: 0 }
   }
 
   /** 判断批次项是否仍属于下一次确认可以提交的集合。 */
@@ -146,7 +151,7 @@ export function useUploadBatch() {
   const submittableFiles = computed(() => submittableItems.value.map((item) => item.file))
 
   const summary = computed<UploadBatchSummary>(() => {
-    const counts = { total: items.value.length, succeeded: 0, failed: 0, cancelled: 0, pending: 0, uploading: 0 }
+    const counts = { total: items.value.length, succeeded: 0, failed: 0, cancelled: 0, pending: 0, uploading: 0, accepted: 0 }
     for (const item of items.value) counts[item.status] += 1
     return counts
   })
@@ -243,7 +248,15 @@ export function useUploadBatch() {
       }
     })
     try {
-      const response = await api.upload(chunk.items.map((item) => item.file), run.options, { signal: controller.signal })
+      const response = await api.upload(chunk.items.map((item) => item.file), chunk.items[0].options || run.options, {
+        signal: controller.signal, requestId: chunk.requestId,
+        onProgress: (value: number) => updateItems((next) => {
+          for (const item of chunk.items) {
+            const current = next.find((candidate) => candidate.id === item.id)
+            if (current) current.progress = value
+          }
+        }),
+      })
       const results = Array.isArray(response?.results) ? response.results : []
       updateItems((next) => {
         for (let index = 0; index < chunk.items.length; index += 1) {
@@ -252,7 +265,7 @@ export function useUploadBatch() {
           if (!current) continue
           const result = results[index] as UploadResult | undefined
           current.result = result
-          current.status = result?.ok === true ? 'succeeded' : 'failed'
+          current.status = result?.ok === true ? 'accepted' : 'failed'
           current.error = result?.ok === true ? undefined : (result?.error || 'request_failed')
           current.retryable = result?.ok === true ? false : !PERMANENT_ERRORS.has(current.error || '')
         }
@@ -332,14 +345,11 @@ export function useUploadBatch() {
         } else next.push(item)
       }
     })
-    const chunks = splitUploadFiles(files, config || {})
-    // 同一 File 引用可能由调用方重复传入；按引用建立先进先出项队列，避免漏传或重复更新首项。
-    const itemsByFile = new Map<File, UploadBatchItem[]>()
-    for (const item of selected) itemsByFile.set(item.file, [...(itemsByFile.get(item.file) || []), item])
-    const queue: UploadChunk[] = chunks.map((chunk) => ({
-      items: chunk.map((file) => itemsByFile.get(file)?.shift() as UploadBatchItem),
-      retryCount: 0,
-    }))
+    // 单文件请求提供真实逐图进度，并让手动重试保留请求身份和处理选项。
+    const queue: UploadChunk[] = selected.map((item) => {
+      item.options ||= { ...options }
+      return { requestId: item.requestId, items: [item], retryCount: 0 }
+    })
     const maxConcurrent = Math.max(1, Math.min(MAX_CONCURRENT_REQUESTS, Number(config?.max_concurrent_upload_requests) || MAX_CONCURRENT_REQUESTS))
     const generation = ++nextGeneration
     busy.value = true
@@ -382,7 +392,7 @@ export function useUploadBatch() {
         }
       }
     })
-    for (const controller of run.controllers) controller.abort()
+    // 已经开始传输的请求继续接收结果，取消按钮只取消尚未发送的文件。
     if (activeRequests.value === 0) complete(run)
   }
 

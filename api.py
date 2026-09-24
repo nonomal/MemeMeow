@@ -33,6 +33,10 @@ from sqlalchemy.orm import Session
 
 from backend.config import Settings, validate_agent_concurrency
 from backend.library_processing import LIBRARY_TASK_TYPE, run_library_processing, submit_library_processing
+from backend.upload_authorization import UploadAuthorization
+from backend.upload_processing import prepare_upload, run_upload_processing, reconcile_upload
+from backend.upload_receive_http import receive_uploads
+from backend.upload_receipts import UPLOAD_TASK_TYPE
 from backend.collection_packages import (
     CollectionPackageError,
     DEFAULT_MAX_FILE_SIZE,
@@ -50,7 +54,7 @@ from backend.image_naming import normalize_display_name, saved_filename
 from backend.persistence.repositories.memes import ImageSort
 from backend.errors import ErrorBody
 from backend.metadata import MetadataError
-from backend.database import DatabaseError, DatabaseResources, Meme, MemeTextEmbedding, ScopeContext, check_database, create_engine_for_settings, utcnow
+from backend.database import DatabaseError, DatabaseResources, Meme, MemeTextEmbedding, ScopeContext, Task, check_database, create_engine_for_settings, utcnow
 from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService, PostgresTaskWorkerManager
 from backend.paths import PathResolver, SUPPORTED_EXTENSIONS, validate_business_storage_key
 from backend.opencode import OpenCodeError, OpenCodeRunner
@@ -299,7 +303,12 @@ def _commit_operation(request: Request, grant) -> None:
 def _release_operation(request: Request, grant) -> None:
     """确认本请求未发生 durable 副作用后释放 reservation，并保留并发 committed 事实。"""
     gateway = _operation_gateway(request)
-    store = getattr(request.app.state, "operation_grants", None)
+    _release_upload_grant(request.app, gateway, grant)
+
+
+def _release_upload_grant(application: FastAPI, gateway: OperationPolicyGateway, grant: Any) -> None:
+    """释放已确认无图片登记副作用的授权，供请求和持久上传任务复用。"""
+    store = getattr(application.state, "operation_grants", None)
     try:
         result = gateway.release(grant)
         if not result.ok or result.state not in {"released", "already_released", "committed", "already_committed"}:
@@ -323,6 +332,12 @@ def _operation_http_error(exc: OperationPolicyError) -> HTTPException:
     """映射稳定 policy 错误，不泄露 policy 原始诊断。"""
     status = 403 if exc.code == "operation_forbidden" else 429 if exc.code in {"operation_limit_exceeded", "operation_daily_limit_exceeded"} else 503
     return _error(status, exc.code, str(exc))
+
+
+def _upload_authorization(application: FastAPI, services: ScopeServices) -> UploadAuthorization:
+    """为当前可信服务构造上传容量授权器。"""
+    gateway = application.state.operation_policy_gateway
+    return UploadAuthorization(services.scope, gateway, application.state.operation_grants, release=lambda grant: _release_upload_grant(application, gateway, grant))
 
 
 def _safe_filename(name: str) -> str:
@@ -1258,6 +1273,21 @@ async def lifespan(app: FastAPI):
             progress(1.0, "单图文本向量已保存")
         return {"meme_id": meme_id, "metadata_hash": frozen_metadata_hash, "embedding_model": app.state.settings.embedding_model}
 
+    def upload_processing_handler(payload: dict[str, Any], progress: Callable[..., Any]) -> dict[str, Any]:
+        """恢复上传任务的可信服务，登记图片并关联后续处理 Job。"""
+        services = app.state.service_factory.for_task(payload["_claim_task_id"])
+        authorization = _upload_authorization(app, services)
+        worker = _scope_processing_worker(app, services.scope)
+        if worker is None:
+            raise ImageProcessingError("image_processing_unavailable")
+
+        def submit_processing(record: Meme, image: Path, options: dict[str, Any]) -> Any:
+            """以接收时保存的选项提交图片处理 Job。"""
+            embedding = services.metadata.embedding_record(image)
+            return worker.submit(record.id, record.sha256, metadata_hash=embedding.get("metadata_hash"), config=_application_processing_config(app), reverse_image_policy=options["reverse_image_policy"], auto_name=options["auto_name"], schedule=True)
+
+        return run_upload_processing(services, payload, progress, prepare=prepare_upload, reserve=authorization.reserve, commit=authorization.finish, submit_processing=submit_processing)
+
     def library_processing_handler(payload: dict[str, Any], progress: Callable[..., Any]) -> dict[str, int]:
         """从持久 Task 恢复服务与处理参数，后台枚举未就绪图片。"""
         services = app.state.service_factory.for_task(payload["_claim_task_id"])
@@ -1283,6 +1313,7 @@ async def lifespan(app: FastAPI):
         register("cache_generation", cache_handler)
         register("metadata_repair", repair_handler)
         register(LIBRARY_TASK_TYPE, library_processing_handler)
+        register(UPLOAD_TASK_TYPE, upload_processing_handler)
         register("derived_thumbnail_generation", thumbnail_handler)
         register("visual_embedding_generation", visual_handler)
         register("meme_context_generation", context_handler)
@@ -1324,6 +1355,25 @@ async def lifespan(app: FastAPI):
         shared_worker_executor = runtime.shared_worker_executor
         local_services = runtime.local_services
         tasks = runtime.tasks
+        upload_cleanup_cursor: str | None = None
+
+        def maintain_uploads() -> None:
+            """分页维护终态上传，释放容量并按保留期限清理输入。"""
+            nonlocal upload_cleanup_cursor
+            with app.state.database.factory() as session:
+                statement = select(Task.id).where(Task.task_type == UPLOAD_TASK_TYPE, Task.status.in_(("succeeded", "failed")))
+                if upload_cleanup_cursor is not None:
+                    statement = statement.where(Task.id > upload_cleanup_cursor)
+                identifiers = list(session.scalars(statement.order_by(Task.id).limit(50)))
+            if not identifiers:
+                upload_cleanup_cursor = None
+                return
+            for identifier in identifiers:
+                upload_cleanup_cursor = identifier
+                services = app.state.service_factory.for_task(identifier)
+                reconcile_upload(services, identifier, _upload_authorization(app, services))
+
+        worker_manager.register_maintenance(maintain_uploads)
         await start_extensions(app, started_extensions)
         yield
     except BaseException as primary:
@@ -2167,35 +2217,13 @@ def _idempotent_upload_result(
     )
 
 
-@app.post("/images/upload", tags=["images"])
+@app.post("/images/upload", status_code=202, tags=["images"])
 async def upload_images(
     request: Request,
 ) -> dict[str, object]:
-    """兼容图片上传入口，并注入当前 scope、校验、operation 和处理任务 callback。"""
-    return await _upload_images_http(
-        request,
-        settings=lambda received: received.app.state.settings,
-        metadata_service=lambda received: _service(received, "metadata"),
-        task_service=lambda received: _service(received, "tasks"),
-        normalize_processing_options=_normalize_processing_options,
-        parse_multipart_bool=_parse_multipart_bool,
-        sanitize_filename=_safe_filename,
-        validate_storage_key=validate_business_storage_key,
-        validate_image=validate_image_content,
-        calculate_sha256=sha256_bytes,
-        processing_worker=_processing_worker,
-        submit_processing_job=_submit_processing_job_for_image,
-        processing_config=_processing_config,
-        submit_visual_task=_submit_visual_task,
-        context_enqueue_error=_context_enqueue_error,
-        acquire_operation=_acquire_operation,
-        commit_operation=_commit_operation,
-        release_operation=_release_operation,
-        invalidate_search=_invalidate_search,
-        error=_error,
-        thumbnail_enqueue=_enqueue_thumbnail,
-        release_errors=UPLOAD_RESERVATION_RELEASE_ERRORS,
-    )
+    """文件接收完成后返回持久 Task，后台执行图片解码与登记。"""
+    services = _request_services(request)
+    return await receive_uploads(request, services=services, options=_normalize_processing_options, parse_bool=_parse_multipart_bool, sanitize=_safe_filename, authorization=_upload_authorization(request.app, services), error=_error)
 
 
 

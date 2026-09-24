@@ -258,6 +258,8 @@ class PostgresTaskService:
         """为普通任务和图片阶段任务生成包含来源模式的稳定活动去重键。"""
         if task_type == "image_library_processing":
             return "library:" + json.dumps(payload.get("options", {}), sort_keys=True, separators=(",", ":"))
+        if task_type == "image_upload":
+            return "upload:" + str(payload["receipt_id"])
         mode = str(payload.get("submission_mode") or ("pipeline" if payload.get("job_id") else "legacy"))
         stage = str(payload.get("stage") or {
             "visual_embedding_generation": "visual",
@@ -1497,6 +1499,18 @@ class PostgresTaskService:
             raise RuntimeError("image_stage_retry_forbidden")
         if record.status != "failed":
             raise RuntimeError("task_not_failed")
+        if record.task_type == "image_upload":
+            from backend.persistence.file_lock import shared_file_lock
+            from backend.upload_receipts import UploadReceipts
+
+            receipts = UploadReceipts(self.resources, self.scope, self)
+            with shared_file_lock(receipts.root / f"{record.payload['receipt_id']}.lock"):
+                with self.resources.environment(self.scope) as environment:
+                    receipt = environment.tasks.get(record.payload["receipt_id"])
+                    if receipt is None or receipt.payload.get("input_removed"):
+                        raise RuntimeError("upload_input_expired")
+                payload = {key: value for key, value in record.payload.items() if not key.startswith("_claim_") and key != "cancel_requested"}
+                return self.submit(record.task_type, payload, _lane="upload")
         payload = {key: value for key, value in record.payload.items() if not key.startswith("_claim_")}
         # 失败任务的同一 dedupe key 已不属于活动集合，submit 会创建新的可轮询尝试。
         return self.submit(record.task_type, payload, _lane_resource_key=record.lane_resource_key)
@@ -1792,6 +1806,7 @@ class PostgresTaskService:
                     "operation_policy_unavailable",
                     "operation_grant_invalid",
                     "blocked",
+                    "task_cancelled",
                 }
                 audit_result = self._with_reverse_image_audit(task_id, None, write_provenance=False)
                 self._fenced_failure(
@@ -1999,6 +2014,24 @@ class PostgresTaskService:
 
     def cancel(self, task_id: str) -> bool:
         """取消单个任务并仅终止其 Agent session，不停止共享容器。"""
+        snapshot = self.get(task_id)
+        if snapshot is not None and snapshot.task_type == "image_upload":
+            with self.resources.environment(self.scope) as environment:
+                record = environment.tasks.get(task_id, for_update=True)
+                if record is None or record.status not in {"queued", "running"}:
+                    return False
+                receipt = environment.tasks.get(snapshot.payload["receipt_id"])
+                if receipt is not None and receipt.payload.get("phase") in {"submitting", "submitted"}:
+                    return False
+                if record.status == "queued":
+                    return environment.tasks.cancel(task_id, error={"error": "task_cancelled", "message": "上传任务已取消"}, message="上传任务已取消")
+                record.payload = {**record.payload, "cancel_requested": True}
+                record.message = "正在取消上传处理"
+                return True
+        return self._cancel_record(task_id)
+
+    def _cancel_record(self, task_id: str) -> bool:
+        """在调用方完成业务互斥后，以短事务取消指定任务。"""
         with self.resources.environment(self.scope.scope_id) as environment:
             record = environment.tasks.get(task_id, for_update=True)
             if record is None:

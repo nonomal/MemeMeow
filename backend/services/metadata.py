@@ -327,11 +327,14 @@ class PostgresMetadataService:
             )
             return self._to_sidecar(record)
 
-    def upload_bytes(self, content: bytes, *, target_key: str) -> tuple[UUID, Path]:
+    def upload_bytes(self, content: bytes, *, target_key: str, receipt_id: str | None = None) -> tuple[UUID, Path]:
         """通过 StorageCoordinator 暂存并提交上传，返回稳定 ID 与受控文件路径。"""
         suffix = Path(target_key).suffix.lower()
         try:
-            record = self.storage.upload(content, target_key=target_key, extension=suffix, context=self._base_context(), provenance={"producer": "system", "model": None, "updated_at": datetime.now(timezone.utc).isoformat(), "field_sources": {}, "last_error": None})
+            provenance = {"producer": "system", "model": None, "updated_at": datetime.now(timezone.utc).isoformat(), "field_sources": {}, "last_error": None}
+            if receipt_id is not None:
+                provenance["upload_receipt_id"] = receipt_id
+            record = self.storage.upload(content, target_key=target_key, extension=suffix, context=self._base_context(), provenance=provenance)
         except DatabaseError as exc:
             raise MetadataError(exc.code) from exc
         return record.id, self.blob_store.resolve(record.storage_key)

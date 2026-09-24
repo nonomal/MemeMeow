@@ -199,6 +199,9 @@ export interface ImageProcessingTerminalEvent {
 }
 
 export interface UploadResult {
+  upload_task_id?: string
+  status?: string
+  batch_id?: string
   meme_id?: string
   filename: string
   ok: boolean

@@ -502,6 +502,21 @@ def sanitize_task_result(task_type: object, value: object) -> dict[str, Any] | N
         dimensions = _safe_int(value.get("dimensions"), maximum=100_000)
         if dimensions is not None:
             result["dimensions"] = dimensions
+    elif task_type == "image_upload":
+        digest = normalize_public_digest(value.get("image_sha256"))
+        if digest is not None:
+            result["image_sha256"] = digest
+        for key in ("filename", "saved_filename"):
+            name = _safe_filename(value.get(key))
+            if name is not None:
+                result[key] = name
+        for key in ("receipt_id", "batch_id", "meme_id", "processing_job_id"):
+            identifier = normalize_public_identifier(value.get(key))
+            if identifier is not None:
+                result[key] = identifier
+        status = normalize_public_code(value.get("processing_status"))
+        if status is not None:
+            result["processing_status"] = status
     elif task_type == "image_library_processing":
         for key in ("scanned_count", "submitted_count", "conflict_count", "not_needed_count"):
             safe = _safe_int(value.get(key))
