@@ -67,6 +67,7 @@ from executor.analysis_policy import AnalysisPolicyError, parse_analysis_policy
 from executor.analysis_monitor import AnalysisMonitor, AnalysisControlError
 from executor.attempt_diagnostics import AttemptOutput, configure_executor_diagnostics, stream_sample as _stream_sample
 from executor.process_supervisor import ProcessSupervisor
+from executor.database_maintenance import DatabaseMaintenance
 from executor.result_store import ExecutorResultStore, ExecutorResultStoreError
 from executor.task_queue import ExecutionQueue
 from executor.token import ExecutorTokenError, ensure_token_file, read_token_file
@@ -361,6 +362,7 @@ class TaskState:
     observed_cost: str | None = None
     usage_checked_at: str | None = None
     reminder_sent: bool = False
+    database_maintenance: dict[str, object] | None = None
 
     def public(self) -> dict[str, object]:
         """返回 API 可见状态，不暴露进程对象和 executor 本地实现细节。"""
@@ -385,6 +387,7 @@ class TaskState:
             "observed_cost": self.observed_cost,
             "usage_checked_at": self.usage_checked_at,
             "reminder_sent": self.reminder_sent,
+            "database_maintenance": self.database_maintenance,
         }
 
 
@@ -448,6 +451,7 @@ class Executor:
         # 控制面维护，避免 HTTP 入口直接持有线程池细节。
         self.pool = ExecutionQueue(self.max_workers, thread_name_prefix="mememeow-opencode")
         self.process_supervisor = ProcessSupervisor()
+        self.database_maintenance = DatabaseMaintenance()
         self.futures: dict[str, Future[None]] = {}
         self.ready_error: str | None = None
         self._prepare_runtime()
@@ -741,6 +745,7 @@ class Executor:
             "observed_cost": task.observed_cost,
             "usage_checked_at": task.usage_checked_at,
             "reminder_sent": task.reminder_sent,
+            "database_maintenance": task.database_maintenance,
         }
         values = [item for item in existing if item.get("executor_attempt_id") != task.executor_attempt_id]
         values.append(entry)
@@ -985,7 +990,7 @@ class Executor:
         source = max(matches, key=lambda task: (task.completed_at or task.created_at, task.created_at))
         if source.status != "failed":
             raise RuntimeError("session_not_resumable")
-        if source.process_reaped is not True:
+        if source.process_reaped is not True or not source.done.is_set():
             raise RuntimeError("session_not_resumable")
         source_error = (source.error or {}).get("error")
         if source_error not in {
@@ -1309,6 +1314,9 @@ class Executor:
         analysis_socket: socket.socket | None = None
         output = AttemptOutput()
         monitor = None
+        database: Path | None = None
+        final_status = "failed"
+        final_error: dict[str, object] | None = None
         started = time.monotonic()
         diagnostic_secrets = secret_inventory_from_mapping(os.environ) + (
             self.legacy_api_key, self.token, task.callback_token or "",
@@ -1318,10 +1326,8 @@ class Executor:
         try:
             with self.lock:
                 if task.cancel_event.is_set():
-                    task.status = "cancelled"
-                    task.error = _json_error("task_interrupted", "任务已取消")
-                    task.completed_at = time.time()
-                    task.done.set()
+                    final_status = "cancelled"
+                    final_error = _json_error("task_interrupted", "任务已取消")
                     return
                 self._verify_task_workspace_capability(task)
                 task.status = "running"
@@ -1391,6 +1397,8 @@ class Executor:
             command = self._sandbox_command(task, command)
             output.phase = "process_start"
             with output.capture(LOG_ROOT, task.task_id) as (out, err):
+                database = Path(env["OPENCODE_DB"])
+                self.database_maintenance.acquire(database)
                 process = subprocess.Popen(command, cwd=process_directory, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
                 output.phase = "process_running"
                 with self.lock:
@@ -1467,15 +1475,14 @@ class Executor:
             with self.lock:
                 if task.cancel_event.is_set():
                     raise RuntimeError("task_interrupted")
-                task.status = "succeeded"
-                task.completed_at = time.time()
+                final_status = "succeeded"
         except _ProcessFailure as exc:
             with self.lock:
                 # 未确认进程已回收时，取消/超时也不能伪装成可安全重试的普通失败。
                 code = exc.code
                 if task.cancel_event.is_set() and code != "unknown_execution":
                     code = "task_interrupted"
-                task.status = "cancelled" if code == "task_interrupted" else "failed"
+                final_status = "cancelled" if code == "task_interrupted" else "failed"
                 error: dict[str, object] = {
                     "error": code,
                     "message": _redact_diagnostic(exc.args[0], (self.legacy_api_key, self.token, task.callback_token or "")),
@@ -1484,8 +1491,7 @@ class Executor:
                     error["analysis_diagnostic"] = exc.analysis_diagnostic
                 if exc.http_status is not None:
                     error["http_status"] = exc.http_status
-                task.error = error
-                task.completed_at = time.time()
+                final_error = error
         except RuntimeError as exc:
             code, _, detail = str(exc).partition(":")
             reason_code = getattr(exc, "reason_code", None)
@@ -1500,34 +1506,36 @@ class Executor:
                     code, detail = "task_interrupted", ""
                 if code not in _EXECUTOR_ERROR_CODES:
                     code = "agent_process_failed"
-                task.status = "cancelled" if code == "task_interrupted" else "failed"
+                final_status = "cancelled" if code == "task_interrupted" else "failed"
                 fallback = {
                     "agent_timeout": "OpenCode 执行超时",
                     "task_interrupted": "任务已取消",
                 }.get(code, "任务执行失败")
-                task.error = _json_error(
+                final_error = _json_error(
                     code,
                     _redact_diagnostic(detail, (self.legacy_api_key, self.token, task.callback_token or "")) if detail else fallback,
                     reason_code=reason_code,
                 )
-                task.completed_at = time.time()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             with self.lock:
                 if process is not None and process.poll() is not None:
                     task.process_reaped = True
                 code = "unknown_execution" if task.process_reaped is not True else "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
-                task.status = "cancelled" if code == "task_interrupted" else "failed"
-                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.legacy_api_key, self.token, task.callback_token or "")))
-                task.completed_at = time.time()
+                final_status = "cancelled" if code == "task_interrupted" else "failed"
+                final_error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.legacy_api_key, self.token, task.callback_token or "")))
         except Exception as exc:  # noqa: BLE001 - 任务必须以终态收束，不能留下永久 running
             with self.lock:
                 if process is not None and process.poll() is not None:
                     task.process_reaped = True
                 code = "unknown_execution" if task.process_reaped is not True else "task_interrupted" if task.cancel_event.is_set() else "agent_process_failed"
-                task.status = "cancelled" if code == "task_interrupted" else "failed"
-                task.error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.legacy_api_key, self.token, task.callback_token or "")))
-                task.completed_at = time.time()
+                final_status = "cancelled" if code == "task_interrupted" else "failed"
+                final_error = _json_error(code, "任务已取消" if code == "task_interrupted" else "无法确认 OpenCode 进程已终止" if code == "unknown_execution" else _redact_diagnostic(str(exc), (self.legacy_api_key, self.token, task.callback_token or "")))
         finally:
+            if process is not None:
+                task.process_reaped = self.process_supervisor.terminate(process).reaped
+                if not task.process_reaped:
+                    final_status = "failed"
+                    final_error = _json_error("unknown_execution", "无法确认 OpenCode 进程已终止")
             if analysis_socket is not None:
                 analysis_socket.close()
                 socket_path = ANALYSIS_SOCKET_ROOT / f"{task.executor_attempt_id}.sock"
@@ -1535,8 +1543,24 @@ class Executor:
                     socket_path.unlink()
                 except FileNotFoundError:
                     pass
+            if database is not None:
+                task.database_maintenance = self.database_maintenance.release(database, process_reaped=task.process_reaped)
+                diagnostic = dict(task.database_maintenance)
+                if "message" in diagnostic:
+                    diagnostic["message"] = _redact_diagnostic(str(diagnostic["message"]), diagnostic_secrets)
+                    task.database_maintenance = diagnostic
+                logger.bind(attempt_id=task.executor_attempt_id, phase="database_checkpoint", **diagnostic).log(
+                    "WARNING" if diagnostic["status"] in {"failed", "skipped"} else "INFO",
+                    "OpenCode 数据库收尾：attempt={}；结果={}", task.executor_attempt_id, diagnostic,
+                )
             with self.lock:
                 task.process = None
+                if task.cancel_event.is_set() and (final_error or {}).get("error") != "unknown_execution":
+                    final_status = "cancelled"
+                    final_error = _json_error("task_interrupted", "任务已取消")
+                task.status = final_status
+                task.error = final_error
+                task.completed_at = time.time()
                 try:
                     self._persist_attempt_metadata(task)
                 except (OSError, ValueError, TypeError):
@@ -1679,19 +1703,12 @@ class Executor:
             task.cancel_event.set()
             was_queued = task.status == "queued"
             process = task.process
-            task.status = "cancelled"
-            task.error = _json_error("task_interrupted", "任务已取消")
-            task.completed_at = time.time()
             if process is None and was_queued:
+                task.status = "cancelled"
+                task.error = _json_error("task_interrupted", "任务已取消")
+                task.completed_at = time.time()
                 task.done.set()
-        if process is not None:
-            reaped = self.process_supervisor.terminate(process).reaped
-            with self.lock:
-                task.process_reaped = reaped
-                if not reaped:
-                    task.status = "failed"
-                    task.error = _json_error("unknown_execution", "无法确认 OpenCode 进程已终止")
-                    task.completed_at = time.time()
+        # 运行任务由执行线程终止并完成数据库维护，再统一发布最终状态。
         return task
 
     def close(self) -> None:
