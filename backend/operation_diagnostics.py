@@ -10,6 +10,7 @@ from types import TracebackType
 from typing import Any
 
 from loguru import logger
+from backend.operation_policy import PolicyFailure
 
 
 _CODE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}\Z")
@@ -62,13 +63,13 @@ class OperationDiagnostics:
 
     def failure(self, error: BaseException) -> None:
         """在错误被转换或保存前记录原因，仅保留错误码、异常类别和 SQLSTATE。"""
-        self.fields.setdefault("error_stage", self._phase)
+        failure = getattr(error, "failure", None)
+        self.fields.setdefault("error_stage", failure.stage if isinstance(failure, PolicyFailure) else self._phase)
         self.fields.setdefault("error_type", type(error).__name__)
         code = getattr(error, "code", None)
         if isinstance(code, str) and _CODE.fullmatch(code):
             self.fields.setdefault("error_code", code)
-        failure = getattr(error, "failure", None)
-        if failure is not None:
+        if isinstance(failure, PolicyFailure):
             self.fields.setdefault("policy_error_code", failure.code)
             self.fields.setdefault("policy_error_stage", failure.stage)
         cause = error.__cause__

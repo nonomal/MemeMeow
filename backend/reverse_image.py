@@ -797,6 +797,9 @@ class ReverseImageService:
         try:
             return task.result(), None, cancellation
         except BaseException as exc:  # noqa: BLE001 - 调用方按既有错误规则完成 usage。
+            if isinstance(exc, ReverseImageError):
+                # 供应商异常不能声明宿主额度原因。
+                exc.failure = None
             return None, exc, cancellation
 
     @staticmethod

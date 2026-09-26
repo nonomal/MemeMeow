@@ -17,7 +17,7 @@ from threading import RLock
 from typing import Any, Mapping, Protocol
 
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError, TimeoutError
 
 from backend.database import OperationGrant, ScopeContext, Task, utcnow
 
@@ -63,6 +63,19 @@ class PolicyFailure:
     def from_payload(cls, value: Mapping[str, object]) -> PolicyFailure:
         """从服务端保存的故障记录重建原因，拒绝不完整记录。"""
         return cls(code=value["error"], message=value["message"], stage=value["stage"])
+
+    @classmethod
+    def from_exception(cls, error: Exception) -> PolicyFailure:
+        """为宿主未分类的异常保留稳定类别，不公开异常正文或数据库参数。"""
+        if isinstance(error, TimeoutError):
+            return cls("operation_database_timeout", "操作策略等待数据库连接超时")
+        if isinstance(error, IntegrityError):
+            return cls("operation_database_integrity_error", "操作策略数据违反数据库完整性约束")
+        if isinstance(error, SQLAlchemyError):
+            return cls("operation_database_error", "操作策略数据库执行出错")
+        if isinstance(error, ValueError):
+            return cls("operation_policy_value_error", "操作策略处理的字段值无效")
+        return cls("operation_policy_runtime_error", "操作策略发生运行错误，请依据关联日志检查异常类别")
 
 
 class OperationPolicyError(RuntimeError):
@@ -290,7 +303,8 @@ def _decision(value: object, *, grant: GrantRef | None = None) -> PolicyDecision
         reason_text = str(reason) if reason else (None if allowed else "operation_limit_exceeded")
         retry_at = value.get("retry_at")
         candidate = value.get("grant")
-        return PolicyDecision(allowed, reason_text, retry_at, candidate if isinstance(candidate, GrantRef) else grant if allowed else None)
+        failure = value.get("failure")
+        return PolicyDecision(allowed, reason_text, retry_at, candidate if isinstance(candidate, GrantRef) else grant if allowed else None, failure if isinstance(failure, PolicyFailure) else None)
     raise OperationPolicyError("operation_policy_unavailable")
 
 
@@ -469,7 +483,7 @@ class OperationPolicyGateway:
         except OperationPolicyError:
             raise
         except Exception as exc:  # noqa: BLE001 - 不泄露宿主策略异常
-            raise OperationPolicyError("operation_policy_unavailable") from exc
+            raise OperationPolicyError("operation_policy_unavailable", failure=PolicyFailure.from_exception(exc)) from exc
 
     def persists_grant(self, request: OperationRequest) -> bool:
         """询问宿主是否在配额事务中原子保存公共 grant，供持久仓储选择写入者。"""
@@ -486,7 +500,7 @@ class OperationPolicyGateway:
         except OperationPolicyError:
             raise
         except Exception as exc:  # noqa: BLE001 - 不泄露宿主策略异常
-            raise OperationPolicyError("operation_policy_unavailable") from exc
+            raise OperationPolicyError("operation_policy_unavailable", failure=PolicyFailure.from_exception(exc)) from exc
 
     def commit(self, grant: GrantRef) -> GrantResult:
         """提交 grant，并将异常收敛为策略不可用。"""
