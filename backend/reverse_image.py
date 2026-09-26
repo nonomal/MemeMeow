@@ -42,7 +42,7 @@ from backend.callbacks import (
     validate_request_binding,
 )
 from backend.database import DatabaseError, DatabaseResources, ReverseImageUsageEvent, ScopeContext, Task, utcnow
-from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, require_allowed
+from backend.operation_policy import AllowAllOperationPolicy, GrantAssociation, GrantAssociationStore, OperationPolicyError, OperationPolicyGateway, Operations, PolicyFailure, require_allowed
 from backend.operation_diagnostics import OperationDiagnostics
 
 
@@ -84,11 +84,19 @@ PROVIDER_RESULT_OBJECT_FIELDS = ("knowledge_graph", "about_this_image")
 class ReverseImageError(RuntimeError):
     """内部检索稳定错误，不携带供应商原始正文、密钥或临时标识。"""
 
-    def __init__(self, code: str, message: str, *, retryable: bool = False, status_code: int = 400):
+    def __init__(self, code: str, message: str, *, retryable: bool = False, status_code: int = 400, failure: PolicyFailure | None = None):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
         self.status_code = status_code
+        self.failure = failure
+
+    def payload(self) -> dict[str, object]:
+        """保存稳定错误与宿主明确提供的公开原因，不读取异常正文。"""
+        value: dict[str, object] = {"error": self.code}
+        if self.failure is not None:
+            value["policy_failure"] = self.failure.payload()
+        return value
 
 
 class NetworkReverseImageSearchProvider(Protocol):
@@ -1124,6 +1132,13 @@ class ReverseImageService:
                 except OperationPolicyError as exc:
                     diagnostics.failure(exc)
                     diagnostics.phase("persist")
+                    if exc.code == "operation_policy_unavailable":
+                        error = ReverseImageError(exc.code, "操作策略暂不可用", retryable=True, status_code=503, failure=exc.failure)
+                        environment.reverse_image_usage.finish(request_id, outcome="failed", retryable=True, error=error.payload())
+                        if callback_row is not None:
+                            environment.callback_requests.finish(request_id, state="failed", error=error.payload())
+                        environment.uow.session.commit()
+                        raise error from exc
                     event = environment.reverse_image_usage.create(
                         request_id=request_id,
                         task_id=request.task_id,
@@ -1279,6 +1294,12 @@ class ReverseImageService:
             diagnostics.fields["recorded_outcome"] = event.outcome
             if isinstance(event.error, Mapping) and isinstance(event.error.get("error"), str):
                 diagnostics.fields.setdefault("error_code", event.error["error"])
+        if isinstance(event.error, Mapping) and event.error.get("error") == "operation_policy_unavailable":
+            recorded = event.error.get("policy_failure")
+            failure = PolicyFailure.from_payload(recorded) if isinstance(recorded, Mapping) else None
+            if diagnostics is not None and failure is not None:
+                diagnostics.fields.setdefault("error_stage", failure.stage)
+            raise ReverseImageError("operation_policy_unavailable", "操作策略暂不可用", retryable=event.retryable, status_code=503, failure=failure)
         payload = event.result or {}
         selected = snapshot or payload.get("snapshot")
         result = selected.get("response") if isinstance(selected, Mapping) else None

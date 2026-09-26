@@ -67,6 +67,10 @@ class OperationDiagnostics:
         code = getattr(error, "code", None)
         if isinstance(code, str) and _CODE.fullmatch(code):
             self.fields.setdefault("error_code", code)
+        failure = getattr(error, "failure", None)
+        if failure is not None:
+            self.fields.setdefault("policy_error_code", failure.code)
+            self.fields.setdefault("policy_error_stage", failure.stage)
         cause = error.__cause__
         if cause is not None:
             self.fields.setdefault("cause_type", type(cause).__name__)

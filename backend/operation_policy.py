@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -37,6 +38,33 @@ OPERATION_ANALYSIS_REVERSE_IMAGE_SEARCH = Operations.ANALYSIS_REVERSE_IMAGE_SEAR
 OPERATION_IMAGE_DELETE = Operations.IMAGE_DELETE
 
 
+@dataclass(frozen=True, slots=True)
+class PolicyFailure:
+    """宿主选定的公开故障原因；字段必须来自固定定义，不含请求数据。"""
+
+    code: str
+    message: str
+    stage: str = "quota"
+
+    def __post_init__(self) -> None:
+        """验证供日志、持久记录和合法调用方共用的原因字段。"""
+        if not isinstance(self.code, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,127}", self.code):
+            raise ValueError("policy_failure_invalid")
+        if not isinstance(self.stage, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", self.stage):
+            raise ValueError("policy_failure_invalid")
+        if not isinstance(self.message, str) or not self.message or len(self.message) > 256 or any(ord(char) < 32 for char in self.message):
+            raise ValueError("policy_failure_invalid")
+
+    def payload(self) -> dict[str, str]:
+        """返回可持久化并公开给当前合法调用方的故障字段。"""
+        return {"error": self.code, "message": self.message, "stage": self.stage}
+
+    @classmethod
+    def from_payload(cls, value: Mapping[str, object]) -> PolicyFailure:
+        """从服务端保存的故障记录重建原因，拒绝不完整记录。"""
+        return cls(code=value["error"], message=value["message"], stage=value["stage"])
+
+
 class OperationPolicyError(RuntimeError):
     """策略边界稳定错误，不携带 policy 原始正文或商业字段。"""
 
@@ -49,9 +77,10 @@ class OperationPolicyError(RuntimeError):
         "operation_grant_invalid": "操作授权无效",
     }
 
-    def __init__(self, code: str, *, retry_at: datetime | str | None = None) -> None:
+    def __init__(self, code: str, *, retry_at: datetime | str | None = None, failure: PolicyFailure | None = None) -> None:
         self.code = code if code in self._messages else "operation_policy_unavailable"
         self.retry_at = retry_at
+        self.failure = failure
         super().__init__(self._messages[self.code])
 
     def payload(self) -> dict[str, object]:
@@ -59,6 +88,8 @@ class OperationPolicyError(RuntimeError):
         value: dict[str, object] = {"error": self.code, "message": self._messages[self.code]}
         if self.retry_at is not None:
             value["retry_at"] = self.retry_at.isoformat() if isinstance(self.retry_at, datetime) else str(self.retry_at)
+        if self.failure is not None:
+            value["policy_failure"] = self.failure.payload()
         return value
 
 
@@ -213,6 +244,7 @@ class PolicyDecision:
     reason: str | None = None
     retry_at: datetime | str | None = None
     grant: GrantRef | None = None
+    failure: PolicyFailure | None = None
 
     @property
     def granted(self) -> bool:
@@ -266,7 +298,7 @@ def require_allowed(result: PolicyDecision) -> GrantRef:
     """将 acquire 拒绝转换为稳定异常，并返回不可伪造 grant。"""
     if not result.allowed or result.grant is None:
         code = result.reason if result.reason in {"operation_forbidden", "operation_limit_exceeded", "operation_daily_limit_exceeded", "operation_policy_unavailable"} else "operation_policy_unavailable"
-        raise OperationPolicyError(code, retry_at=result.retry_at)
+        raise OperationPolicyError(code, retry_at=result.retry_at, failure=result.failure)
     return result.grant
 
 

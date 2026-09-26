@@ -36,6 +36,17 @@ ScopeServicesProvider = Callable[[Request, ScopeContext], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 
 
+def _policy_failure_http_error(exc: ReverseImageError, *, error: ErrorFactory) -> HTTPException:
+    """将宿主已脱敏的额度故障交给合法 callback 调用方，首次调用与重放共用。"""
+    failure = exc.failure
+    if failure is None:
+        return error(exc.status_code, exc.code, str(exc))
+    result = error(exc.status_code, failure.code, failure.message)
+    result.detail["stage"] = failure.stage
+    result.detail["policy_error"] = exc.code
+    return result
+
+
 async def _run_sync_search(search: Callable[[ReverseImageRequest], object], payload: ReverseImageRequest) -> object:
     """在线程中兼容同步 service，并在取消时等待其完整退出。"""
     worker = asyncio.create_task(run_in_threadpool(search, payload))
@@ -111,7 +122,7 @@ async def internal_reverse_image_search(
         services = scope_services(request, callback_scope)
         service = services.reverse_image
     except ReverseImageError as exc:
-        raise error(exc.status_code, exc.code, str(exc)) from exc
+        raise _policy_failure_http_error(exc, error=error) from exc
     except CallbackError as exc:
         raise error(401, "agent_callback_invalid_execution", "内部执行绑定无效") from exc
     except ScopeResolutionError as exc:
@@ -160,7 +171,7 @@ async def internal_reverse_image_search(
             raise RuntimeError("reverse_image_service_invalid")
         return result
     except ReverseImageError as exc:
-        raise error(exc.status_code, exc.code, str(exc)) from exc
+        raise _policy_failure_http_error(exc, error=error) from exc
     except DatabaseError as exc:
         status = 404 if exc.code == "meme_not_found" else 409 if exc.code in {"usage_request_conflict", "usage_event_conflict", "callback_request_conflict", "callback_binding_conflict"} else 503
         raise error(status, exc.code, "反向图片请求无法完成") from exc
