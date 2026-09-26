@@ -60,7 +60,12 @@ def test_current_upload_status(tmp_path, valid):
         """运行上传校验、图片保存、授权结算和后续任务提交。"""
         return run_upload_processing(services, payload, progress, prepare=prepare_upload, reserve=authorization.reserve, commit=authorization.finish, submit_processing=submit_processing)
 
+    def thumbnail_handler(payload, progress):
+        """执行本次图片的真实缩略图生成。"""
+        return thumbnails.generate(payload["meme_id"])
+
     tasks.register("image_upload", handler)
+    tasks.register(thumbnails.TASK_TYPE, thumbnail_handler)
     receipts = UploadReceipts(resources, scopes[0], tasks)
     request_ids = [uuid4().hex, uuid4().hex]
     try:
@@ -93,6 +98,13 @@ def test_current_upload_status(tmp_path, valid):
             assert selected[0]["error"]["error"] == "invalid_image"
             with pytest.raises(RuntimeError, match="invalid_image"):
                 tasks.retry(selected[0]["task_id"])
+        deadline = monotonic() + 20
+        while monotonic() < deadline:
+            attempts = [tasks.get(record["task_id"]) for record in records]
+            if all(task.status in {"succeeded", "failed"} for task in attempts):
+                break
+            sleep(0.05)
+        assert all(task.status == ("succeeded" if valid else "failed") for task in attempts), [task.error for task in attempts]
     finally:
         tasks._executor.shutdown(wait=True)
         tasks.shutdown()
