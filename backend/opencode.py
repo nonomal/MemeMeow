@@ -1881,8 +1881,7 @@ class OpenCodeRunner:
                 else "这是首次执行；先建立任务草稿并逐步完成研究。"
             )
             prompt = (
-                "使用 research-meme-context skill 分析这张表情包；先读取当前任务固定候选 manifest，"
-                "候选只作为参考证据。"
+                "使用 research-meme-context skill 分析这张表情包；不要使用本地以图搜图。"
                 "必须直接通过视觉模型查看输入图片并识别图片文字，禁止调用任何本地文字识别程序、命令或脚本。"
                 "遇到错误时自行尝试可行的替代方案；确认无法解决时，简短说明原因并退出。"
                 f"本任务 reverse_image_policy={reverse_image_policy if reverse_image_policy in {'forbid', 'auto'} else 'forbid'}；只能通过项目内部反向图片接口使用能力，绝不读取或请求供应商密钥。"
