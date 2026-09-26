@@ -1608,6 +1608,16 @@ class TaskRepository:
         self.session.flush()
         return True
 
+    def latest_uploads(self, request_ids: list[str]) -> list[Task]:
+        """按当前 scope 和请求标识读取每个接收记录的最新上传尝试。"""
+        receipt = Task.payload["receipt_id"].astext
+        statement = select(Task).where(
+            Task.scope_id == self.scope.scope_id,
+            Task.task_type == "image_upload",
+            Task.payload["batch_id"].astext.in_(request_ids),
+        ).distinct(receipt).order_by(receipt, Task.created_at.desc(), Task.id.desc())
+        return list(self.session.scalars(statement))
+
     def list(self, *, statuses: set[str] | None = None, task_types: set[str] | None = None, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
         """按创建时间和 ID 稳定分页列出当前 scope 任务。"""
         page_limit = max(1, min(limit, 100))

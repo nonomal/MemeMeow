@@ -69,6 +69,8 @@ from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS, _storage_prefli
 from backend.search_http import SearchRequest, search_images as _search_images
 from backend.cache_task_http import generate_cache as _generate_cache
 from backend.task_http import (
+    UploadStatusRequest,
+    upload_status as _upload_status_http,
     activity_payload as _task_activity_payload,
     cancel_task as _cancel_task_http,
     get_task as _get_task_http,
@@ -1671,6 +1673,12 @@ def _task_summary(request: Request, record: TaskRecord, activities: Mapping[str,
         service=_service,
         processing_repository=_processing_repository,
     )
+
+
+@app.post("/images/uploads/status", tags=["images", "tasks"])
+async def upload_status(request: Request, payload: UploadStatusRequest) -> dict[str, object]:
+    """按上传请求集合读取当前 scope 的图片保存状态。"""
+    return await _upload_status_http(request, payload, service=_service)
 
 
 @app.get("/tasks", tags=["tasks"])

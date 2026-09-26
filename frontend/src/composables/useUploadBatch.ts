@@ -67,6 +67,7 @@ const PERMANENT_ERRORS = new Set([
   'invalid_filename',
   'file_too_large',
   'file_exists',
+  'image_exists',
   'upload_reconciliation_required',
   'too_many_files',
   'request_too_large',

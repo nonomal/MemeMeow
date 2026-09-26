@@ -59,6 +59,7 @@ from backend.tasks import (
     TERMINAL,
     STABLE_TASK_ERRORS,
 )
+from backend.upload_status import SAVED_UPLOAD_PHASES, upload_retry_error
 from backend.scope import validate_scope_services
 from backend.services.worker_manager import PostgresTaskWorkerManager
 from backend.persistence.repositories.tasks import validate_lane_resource_key, validate_lane_resource_concurrency
@@ -1507,8 +1508,9 @@ class PostgresTaskService:
             with shared_file_lock(receipts.root / f"{record.payload['receipt_id']}.lock"):
                 with self.resources.environment(self.scope) as environment:
                     receipt = environment.tasks.get(record.payload["receipt_id"])
-                    if receipt is None or receipt.payload.get("input_removed"):
-                        raise RuntimeError("upload_input_expired")
+                    reason = upload_retry_error(record.status, record.error, receipt.payload if receipt else None)
+                    if reason:
+                        raise RuntimeError(reason)
                 payload = {key: value for key, value in record.payload.items() if not key.startswith("_claim_") and key != "cancel_requested"}
                 return self.submit(record.task_type, payload, _lane="upload")
         payload = {key: value for key, value in record.payload.items() if not key.startswith("_claim_")}
@@ -2041,6 +2043,28 @@ class PostgresTaskService:
             handler = self._handlers.get(record.task_type)
             _ = handler  # 仅保留任务类型快照，实际 session 清理由运行器按 task_id 完成。
         return changed
+
+    def upload_status(self, request_ids: list[str]) -> list[dict[str, Any]]:
+        """用一个短事务返回本次上传的安全结果和重试资格。"""
+        with self.resources.environment(self.scope.scope_id) as environment:
+            records = environment.tasks.latest_uploads(request_ids)
+            receipt_ids = {record.payload["receipt_id"] for record in records}
+            receipts = {row.id: row.payload for row in environment.uow.session.scalars(
+                select(Task).where(Task.scope_id == self.scope.scope_id, Task.id.in_(receipt_ids))
+            )} if receipt_ids else {}
+            result = []
+            for record in records:
+                public = self._record_to_dataclass(record).as_dict()
+                receipt = receipts.get(record.payload["receipt_id"])
+                saved = bool(receipt and receipt.get("phase") in SAVED_UPLOAD_PHASES)
+                reason = upload_retry_error(record.status, record.error, receipt)
+                result.append({
+                    "task_id": public["task_id"], "upload": public["upload"],
+                    "status": "succeeded" if saved else record.status,
+                    "error": None if saved else public["error"],
+                    "retryable": not saved and reason is None, "retry_reason": reason,
+                })
+            return result
 
     def list(self, *, statuses: set[str] | None = None, task_types: set[str] | None = None, cursor: str | None = None, limit: int = 50) -> tuple[list[TaskRecord], str | None]:
         """分页列出当前 scope 任务，返回兼容 TaskRecord 的安全快照。"""

@@ -110,6 +110,7 @@ export const api = {
   retryImageStagesBatch: (payload) => request('/images/stages/batch', { method: 'POST', body: JSON.stringify(payload) }),
   retryImageStage: (payload) => request('/images/stages', { method: 'POST', body: JSON.stringify(payload) }),
   imageStage: (payload) => request('/images/stages', { method: 'POST', body: JSON.stringify(payload) }),
+  uploadStatus: (requestIds) => request('/images/uploads/status', { method: 'POST', body: JSON.stringify({ request_ids: requestIds }) }),
   task: (id) => request(`/tasks/${id}`),
   retryTask: (id) => request(`/tasks/${encodeURIComponent(id)}/retry`, { method: 'POST' }),
   cancelTask: (id) => request(`/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),

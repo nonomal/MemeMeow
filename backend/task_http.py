@@ -9,8 +9,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 from fastapi import HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from backend.agent_resume import within_total_timeout
@@ -26,12 +28,26 @@ from backend.public_dto import (
     sanitize_task_result,
 )
 from backend.tasks import TaskRecord
+from backend.upload_status import PERMANENT_UPLOAD_ERRORS
 
 
 Service = Callable[[Request, str], Any]
 ErrorFactory = Callable[[int, str, str], HTTPException]
 ProcessingRepository = Callable[[Request], Any]
 CancelAgent = Callable[[Request, str], None]
+
+
+class UploadStatusRequest(BaseModel):
+    """限制一次上传状态查询的请求数量，账户范围由服务端解析。"""
+
+    model_config = ConfigDict(extra="forbid")
+    request_ids: list[UUID] = Field(min_length=1, max_length=100)
+
+
+async def upload_status(request: Request, payload: UploadStatusRequest, *, service: Service) -> dict[str, object]:
+    """查询指定上传请求的最新结果，返回已脱敏的上传记录。"""
+    items = await run_in_threadpool(service(request, "tasks").upload_status, [value.hex for value in payload.request_ids])
+    return {"items": items}
 
 
 def activity_payload(value: object) -> dict[str, object] | None:
@@ -330,6 +346,10 @@ def _retry_task(request: Request, task_id: str, *, service: Service, error: Erro
             raise error(409, code, "图片阶段必须通过完整 Job 或专用阶段入口重试") from exc
         if code == "agent_backpressure":
             raise error(429, code, "Agent 等待队列已满，请稍后重试") from exc
+        if code == "upload_input_expired":
+            raise error(409, code, "上传输入已过期，请重新选择文件") from exc
+        if code in PERMANENT_UPLOAD_ERRORS:
+            raise error(409, code, f"当前上传无法重试：{code}") from exc
         raise error(409, code, "任务重试失败") from exc
     return task_summary(request, record, service=service, processing_repository=processing_repository)
 

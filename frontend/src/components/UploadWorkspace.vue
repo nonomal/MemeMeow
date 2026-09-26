@@ -1,15 +1,16 @@
 <script setup lang="ts">
 /** 上传工作区：管理文件选择、选项确认与逐文件结果。 */
-import { computed, onMounted, onUnmounted, shallowRef, watch } from 'vue'
+import { computed, onMounted, onUnmounted, shallowRef } from 'vue'
 import type { ImageProcessingOptions, ServiceConfig } from '../types'
 import { uploadErrorMessage } from '../utils/presentation'
 import ImageProcessingOptionsDialog from './ImageProcessingOptionsDialog.vue'
 import UploadPendingItem from './UploadPendingItem.vue'
 import UploadTaskHistory from './UploadTaskHistory.vue'
-import { useUploadBatch, type UploadBatchItem } from '../composables/useUploadBatch'
+import { useUploadBatch } from '../composables/useUploadBatch'
 
 const props = defineProps<{
   config: ServiceConfig | null
+  storageScope?: string
 }>()
 
 const emit = defineEmits<{
@@ -24,10 +25,14 @@ const retryOptions = shallowRef<ImageProcessingOptions>({ reverse_image_policy: 
 const preserveRetryOptions = shallowRef(false)
 const batch = useUploadBatch()
 const taskHistory = shallowRef<InstanceType<typeof UploadTaskHistory> | null>(null)
-watch(() => batch.summary.value.accepted, () => { void taskHistory.value?.refresh() })
 const batchItems = batch.items
 const batchSummary = batch.summary
-const submitFiles = batch.submittableFiles
+const selectedItems = computed(() => {
+  const pending = batchItems.value.filter((item) => item.status === 'pending' && item.attempts === 0)
+  return pending.length ? pending : batch.submittableItems.value
+})
+const submitFiles = computed(() => selectedItems.value.map((item) => item.file))
+const pendingItems = computed(() => batchItems.value.filter((item) => item.status === 'pending' && item.attempts === 0))
 const busy = batch.busy
 const paused = batch.paused
 const isDragActive = shallowRef(false)
@@ -36,7 +41,6 @@ const queuedItemCount = computed(() => batchItems.value.filter((item) => (
   || item.status === 'uploading'
   || (item.status === 'failed' && item.retryable)
 )).length)
-const canRetryFailed = computed(() => !busy.value && batchItems.value.some((item) => item.status === 'failed' && item.retryable))
 
 /** 剪贴板图片的受支持 MIME 与扩展名，必须与后端上传格式保持一致。 */
 const clipboardImageExtensions: Readonly<Record<string, string>> = {
@@ -52,21 +56,24 @@ const supportedImageMimeTypes = new Set(Object.keys(clipboardImageExtensions))
 let pastedFileSequence = 0
 let dragDepth = 0
 
-/** 读取原生文件输入，以替换当前批次中的本地待上传项。 */
+/** 文件选择、拖放和粘贴共用追加入口，确认提交时确定本次文件集合。 */
 function onFiles(event: Event): void {
   if (busy.value) return
   const input = event.target as HTMLInputElement
-  batch.setFiles([...(input.files || [])])
+  appendLocalFiles([...(input.files || [])])
   // 文件已复制到批次状态；清空原生值后，删除后再次选择同一文件仍会触发 change。
   input.value = ''
-  preserveRetryOptions.value = false
-  retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
 }
 
 /** 将一组本地文件追加到批次，供剪贴板和后续拖放入口共用。 */
 function appendLocalFiles(files: File[]): void {
-  if (busy.value) return
-  batch.appendFiles(files)
+  if (busy.value || !files.length) return
+  if (pendingItems.value.length) batch.appendFiles(files)
+  else {
+    batch.setFiles(files)
+    preserveRetryOptions.value = false
+    retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
+  }
 }
 
 /** 判断拖放文件是否落在既有受控图片范围，类型缺失时仍接受受控扩展名。 */
@@ -215,6 +222,7 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
   retryOptions.value = options
   preserveRetryOptions.value = true
   const selectedFiles = submitFiles.value
+  taskHistory.value!.begin(selectedItems.value)
   dialogOpen.value = false
   const outcome = await batch.start(selectedFiles, options, props.config)
   await taskHistory.value?.refresh()
@@ -228,20 +236,13 @@ async function confirmOptions(options: ImageProcessingOptions): Promise<void> {
   retryOptions.value = { reverse_image_policy: 'forbid', auto_name: false }
 }
 
-/** 返回不依赖后端枚举原文的逐项状态文案。 */
-function statusLabel(item: UploadBatchItem): string {
-  if (item.status === 'accepted') return '已接收，后台处理中'
-  if (item.status === 'succeeded') return '完成'
-  if (item.status === 'uploading') return item.progress >= 1 ? '传输完成，等待接收确认' : `传输中 ${Math.floor(item.progress * 100)}%`
-  if (item.status === 'pending') return '等待中'
-  if (item.status === 'cancelled') return '已取消'
-  return item.error === 'rate_limited' ? '等待重试' : '失败'
-}
-
-/** 展示服务端成功摘要或稳定错误原因，不把内部错误码直接暴露给用户。 */
-function itemDetail(item: UploadBatchItem): string {
-  if (item.error) return uploadErrorMessage(item.error)
-  return item.result?.saved_filename || item.result?.processing_status || ''
+/** 单项传输重试沿用原请求和选项，结果继续属于当前上传组。 */
+async function retryTransfer(requestId: string): Promise<void> {
+  const item = batchItems.value.find((candidate) => candidate.requestId === requestId)
+  if (busy.value || !item || !item.retryable || !item.options) return
+  taskHistory.value!.begin([item])
+  await batch.start([item.file], item.options, props.config)
+  await taskHistory.value!.refresh()
 }
 </script>
 
@@ -267,34 +268,24 @@ function itemDetail(item: UploadBatchItem): string {
       <button class="primary wide" type="button" :disabled="busy || !submitFiles.length" @click="openOptions">
         {{ busy ? '上传中...' : '上传所选图片' }}
       </button>
-      <div v-if="batchSummary.total" class="upload-summary" aria-live="polite">
-        <strong>本次已接收 {{ batchSummary.accepted }} / {{ batchSummary.total }}</strong>
-        <span>传输失败 {{ batchSummary.failed }}，取消 {{ batchSummary.cancelled }}</span>
+      <div v-if="busy" class="upload-summary" aria-live="polite">
         <span v-if="batchSummary.pending" class="summary-muted">等待 {{ batchSummary.pending }}</span>
         <button v-if="busy && !paused" class="quiet" type="button" @click="batch.pause">暂停</button>
         <button v-if="busy && paused" class="quiet" type="button" @click="batch.resume">继续</button>
         <button v-if="busy" class="quiet" type="button" aria-label="取消未发送图片" @click="batch.cancel">取消未发送</button>
-        <button v-if="canRetryFailed" class="quiet" type="button" @click="openOptions">重试失败项</button>
       </div>
     </div>
-    <div v-if="batchItems.length" class="upload-results" aria-live="polite">
-      <!-- 单次遍历让待上传项与活动结果始终保持原始拖放顺序。 -->
-      <template v-for="item in batchItems" :key="item.id" v-memo="[busy, item.file, item.status, item.progress, item.error, item.file.name, item.result?.meme_id, item.result?.processing_status, item.result?.saved_filename, item.result?.processing_job_id, item.result?.metadata_job_id]">
+    <div v-if="!busy && pendingItems.length" class="upload-results" aria-live="polite">
+      <template v-for="item in pendingItems" :key="item.id">
         <UploadPendingItem
           v-if="item.status === 'pending'"
           :item="item"
           :removable="!busy"
           @remove="batch.removePending"
         />
-        <div v-else-if="item.status !== 'accepted'" class="upload-result" :class="{ fail: item.status === 'failed' || item.status === 'cancelled' }">
-          <span>{{ statusLabel(item) }}</span>
-          <strong :title="item.file.name">{{ item.file.name }}</strong>
-          <button v-if="item.result?.processing_job_id || item.result?.metadata_job_id" class="quiet" type="button" @click="emit('openTask', item.result?.processing_job_id || item.result?.metadata_job_id || '')">查看任务</button>
-          <small>{{ itemDetail(item) }}</small>
-        </div>
       </template>
     </div>
-    <UploadTaskHistory ref="taskHistory" />
+    <UploadTaskHistory ref="taskHistory" :key="props.storageScope || 'local'" :items="batchItems" :busy="busy" :storage-scope="props.storageScope" @retry-transfer="retryTransfer" />
   </section>
 
   <ImageProcessingOptionsDialog
