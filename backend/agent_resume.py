@@ -41,6 +41,7 @@ RESUME_RETRYABLE_ERRORS = frozenset(
         "agent_connection_interrupted",
         "agent_process_failed",
         "agent_executor_unavailable",
+        "service_shutdown",
     }
 )
 RESUME_UNSAFE_ERRORS = frozenset(
@@ -113,6 +114,8 @@ def agent_failure_requires_unknown(
         return True
     # provider/进程错误同样发生在 Agent 调用边界之后；没有 session 就无法证明
     # 请求是否已经生效，不能因恢复标识缺失而退化为一次全新的外部调用。
+    if normalized == "service_shutdown":
+        return False
     if normalized in RESUME_RETRYABLE_ERRORS:
         # 仅有 session 字符串还不足以证明它已经和当前失败 attempt 绑定；
         # handler 必须先把带 fencing 的 attempt 事实成功写入数据库。

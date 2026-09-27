@@ -85,6 +85,8 @@ _KNOWN_TASK_ERRORS = frozenset(
         "agent_maximum_analysis_depth_exceeded",
         "agent_timeout",
         "task_interrupted",
+        "service_shutdown",
+        "agent_attempt_metadata_write_failed",
         "agent_process_failed",
         "unknown_execution",
         "agent_output_invalid_json",
@@ -329,11 +331,18 @@ class AgentExecutorClient:
             trigger_reason=trigger_reason,
         )
 
-    def _wait_for_terminal(self, response: ExecutorTaskResponse, *, task_id: str, executor_task_id: str, timeout_seconds: int) -> ExecutorTaskResponse:
+    def _wait_for_terminal(self, response: ExecutorTaskResponse, *, task_id: str, executor_task_id: str, timeout_seconds: int, shutdown_requested: Callable[[], bool] | None = None) -> ExecutorTaskResponse:
         """轮询同步提交的非终态响应，超时后只取消当前任务。"""
         deadline = time.monotonic() + max(5, int(timeout_seconds) + 10)
         poll_delay = 0.2
+        shutdown_sent = False
         while response.status in _PENDING_STATUSES:
+            # 提交和关闭可能并发；提交返回后由原线程补发中断，并继续等待终态。
+            if not shutdown_sent and shutdown_requested is not None and shutdown_requested():
+                response = self._for_task(self.cancel(executor_task_id, reason="service_shutdown"), task_id)
+                shutdown_sent = True
+                if response.status not in _PENDING_STATUSES:
+                    break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 cancelled_response: ExecutorTaskResponse | None = None
@@ -426,6 +435,7 @@ class AgentExecutorClient:
         model_capability: str | None = None,
         visual_snapshot_sha256: str | None = None,
         analysis_policy: dict[str, object] | None = None,
+        shutdown_requested: Callable[[], bool] | None = None,
     ) -> ExecutorTaskResponse:
         """提交绑定模型 capability 的独立 executor attempt，并可按明确 session 续跑。"""
         timeout_value = int(timeout_seconds)
@@ -452,7 +462,7 @@ class AgentExecutorClient:
                     "image_relative_path": image_relative_path,
                     "reverse_image_policy": reverse_image_policy,
                     "timeout_seconds": timeout_value,
-                    "wait": True,
+                    "wait": False,
                     **({"session_id": session_id} if session_id else {}),
                     **({"resume_of_attempt_id": resume_of_attempt_id} if resume_of_attempt_id else {}),
                     **({"processing_config_hash": processing_config_hash} if processing_config_hash else {}),
@@ -501,7 +511,7 @@ class AgentExecutorClient:
         # 的轮询兼容；新协议总会返回显式 executor_attempt_id。
         executor_task_id = response.executor_attempt_id or task_id
         try:
-            response = self._wait_for_terminal(response, task_id=task_id, executor_task_id=executor_task_id, timeout_seconds=timeout_value)
+            response = self._wait_for_terminal(response, task_id=task_id, executor_task_id=executor_task_id, timeout_seconds=timeout_value, shutdown_requested=shutdown_requested)
         except AgentExecutorError as exc:
             raise AgentExecutorError(
                 exc.code,
@@ -559,9 +569,12 @@ class AgentExecutorClient:
             raise AgentExecutorError("agent_executor_invalid_response", "Agent executor 任务状态无效")
         return response
 
-    def cancel(self, task_id: str) -> ExecutorTaskResponse:
+    def cancel(self, task_id: str, *, reason: str = "task_interrupted") -> ExecutorTaskResponse:
         """取消指定任务，超时或服务关闭时调用。"""
-        _status, value = self._request("POST", f"/v1/tasks/{quote(task_id, safe='')}/cancel", timeout=min(10, self.timeout))
+        if reason not in {"task_interrupted", "service_shutdown"}:
+            raise ValueError("invalid_interruption_reason")
+        action = "interrupt-for-shutdown" if reason == "service_shutdown" else "cancel"
+        _status, value = self._request("POST", f"/v1/tasks/{quote(task_id, safe='')}/{action}", timeout=min(10, self.timeout))
         return self._for_executor_attempt(self._response(value), task_id)
 
     def status(self, task_id: str) -> ExecutorTaskResponse:

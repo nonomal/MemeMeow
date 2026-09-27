@@ -906,6 +906,8 @@ async def lifespan(app: FastAPI):
                 target_unchanged=True,
                 grant_state="committed" if grant is not None else None,
             )
+            if exc.code == "service_shutdown" and exc.process_reaped is not True:
+                decision = ResumeDecision(False, "unknown_execution", False)
             if not resume_enabled:
                 # rollout 关闭时保留旧任务级 retry，但不得把 session 标成可续跑；
                 # 否则开关热切换或任务详情会误把旧失败当成恢复目标。

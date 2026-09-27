@@ -1536,6 +1536,8 @@ class PostgresTaskService:
         """执行已认领任务并以 claim generation fencing 写回终态。"""
         claim = preclaimed
         try:
+            if claim is None and self._stopped.is_set():
+                return
             if claim is None:
                 with self.resources.environment(self.scope.scope_id) as environment:
                     queued_record = environment.tasks.get(task_id)
@@ -1740,6 +1742,7 @@ class PostgresTaskService:
                     max_seconds=self.resume_max_backoff_seconds,
                 )
                 retry = code not in {
+                    "agent_attempt_metadata_write_failed",
                     "agent_reservation_expired",
                     "agent_reservation_deadline_invalid",
                     "target_changed",
@@ -1811,6 +1814,8 @@ class PostgresTaskService:
                     "task_cancelled",
                 }
                 audit_result = self._with_reverse_image_audit(task_id, None, write_provenance=False)
+                if code == "service_shutdown":
+                    retry = self.resume_enabled and resume_available
                 self._fenced_failure(
                     task_id,
                     generation,
@@ -1841,6 +1846,7 @@ class PostgresTaskService:
                         )
             finally:
                 heartbeat_stop.set()
+                heartbeat_thread.join()
             self._maybe_finalize(task_id)
         finally:
             if self._worker_manager is not None:
@@ -1913,6 +1919,7 @@ class PostgresTaskService:
                 resume_reason=resume_reason,
                 session_id=session_id,
                 executor_attempt_id=executor_attempt_id,
+                resume_max_attempts=self.resume_max_attempts if self.resume_enabled else 0,
             )
             if changed and not _should_retry and self._operation_policy is not None:
                 self._operation_policy.settle_task(environment.uow.session, self.scope, task_id)
@@ -2116,12 +2123,18 @@ class PostgresTaskService:
             except Exception:
                 pass
 
-    def shutdown(self) -> None:
-        """停止新认领并将本 Worker 仍持有的任务标记为可诊断中断。"""
+    def stop_claiming(self) -> None:
+        """停止认领新 Task，保留当前执行线程的租约和心跳。"""
         if self._worker_manager is not None:
             return
         self._stopped.set()
+
+    def shutdown(self) -> None:
+        """等待自有线程退出，再处理未完成的任务记录。"""
+        if self._worker_manager is not None:
+            return
+        self.stop_claiming()
+        if self._owns_executor:
+            self._executor.shutdown(wait=True, cancel_futures=True)
         with self.resources.environment(self.scope.scope_id) as environment:
             environment.tasks.interrupt_owner(self.owner)
-        if self._owns_executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)

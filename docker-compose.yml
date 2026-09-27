@@ -156,6 +156,8 @@ services:
 
   mememeow:
     profiles: ["app"]
+    # API 需要等待 Agent 进程结束和恢复信息保存，依赖服务随后关闭。
+    stop_grace_period: 120s
     depends_on:
       postgres:
         condition: service_healthy

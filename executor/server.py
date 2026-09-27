@@ -357,6 +357,7 @@ class TaskState:
     result_path: str | None = None
     process: subprocess.Popen[bytes] | None = field(default=None, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    cancel_reason: str | None = None
     done: threading.Event = field(default_factory=threading.Event, repr=False)
     analysis_policy: dict[str, object] | None = field(default=None, repr=False)
     observed_cost: str | None = None
@@ -787,6 +788,7 @@ class Executor:
                 continue
             error = entry.get("error") if isinstance(entry.get("error"), dict) else {}
             if error.get("error") not in {
+                "service_shutdown",
                 "agent_provider_rate_limited",
                 "agent_provider_server_error",
                 "agent_connection_interrupted",
@@ -994,6 +996,7 @@ class Executor:
             raise RuntimeError("session_not_resumable")
         source_error = (source.error or {}).get("error")
         if source_error not in {
+            "service_shutdown",
             "agent_provider_rate_limited",
             "agent_provider_server_error",
             "agent_connection_interrupted",
@@ -1307,6 +1310,9 @@ class Executor:
 
     def _run(self, task: TaskState) -> None:
         """执行 OpenCode 任务并更新状态，失败时保存脱敏后的有限诊断。"""
+        with self.lock:
+            if task.done.is_set():
+                return
         process: subprocess.Popen[bytes] | None = None
         stdout = b""
         stderr = b""
@@ -1556,16 +1562,21 @@ class Executor:
             with self.lock:
                 task.process = None
                 if task.cancel_event.is_set() and (final_error or {}).get("error") != "unknown_execution":
-                    final_status = "cancelled"
-                    final_error = _json_error("task_interrupted", "任务已取消")
+                    if task.cancel_reason != "service_shutdown":
+                        final_status = "cancelled"
+                        final_error = _json_error("task_interrupted", "任务已取消")
+                    elif (final_error or {}).get("error") == "task_interrupted":
+                        final_status = "failed"
+                        final_error = _json_error("service_shutdown", "服务正常关闭，Agent 执行已中断")
                 task.status = final_status
                 task.error = final_error
                 task.completed_at = time.time()
                 try:
                     self._persist_attempt_metadata(task)
-                except (OSError, ValueError, TypeError):
-                    # 元数据写入失败时，后续恢复会因缺少签名事实被拒绝。
-                    pass
+                except (OSError, ValueError, TypeError) as exc:
+                    task.status = "failed"
+                    task.error = _json_error("agent_attempt_metadata_write_failed", "无法保存 executor attempt 恢复信息")
+                    logger.error("attempt 恢复信息保存失败：attempt={} error={}", task.executor_attempt_id, type(exc).__name__)
                 task.done.set()
             if task.status in {"failed", "cancelled"}:
                 secrets = diagnostic_secrets + (task.session_id or "",)
@@ -1692,21 +1703,32 @@ class Executor:
         """终止任务进程组并返回父进程是否已被 waitpid 确认回收。"""
         return ProcessSupervisor().terminate(process).reaped
 
-    def cancel(self, task_id: str) -> TaskState:
+    def cancel(self, task_id: str, *, reason: str = "task_interrupted") -> TaskState:
         """取消指定任务；只终止该任务进程，不影响 executor 或其他任务。"""
+        if reason not in {"task_interrupted", "service_shutdown"}:
+            raise ValueError("invalid_interruption_reason")
         with self.lock:
             task = self.tasks.get(task_id)
             if task is None:
                 raise KeyError(task_id)
             if task.status in {"succeeded", "failed", "cancelled"}:
                 return task
+            # 用户取消优先；后续停机通知不能改变已经收到的取消原因。
+            if task.cancel_reason is None or reason == "task_interrupted":
+                task.cancel_reason = reason
             task.cancel_event.set()
             was_queued = task.status == "queued"
             process = task.process
             if process is None and was_queued:
-                task.status = "cancelled"
-                task.error = _json_error("task_interrupted", "任务已取消")
+                task.status = "failed" if task.cancel_reason == "service_shutdown" else "cancelled"
+                task.error = _json_error(task.cancel_reason, "服务正常关闭，尚未开始执行" if task.cancel_reason == "service_shutdown" else "任务已取消")
                 task.completed_at = time.time()
+                try:
+                    self._persist_attempt_metadata_locked(task)
+                except (OSError, ValueError, TypeError) as exc:
+                    task.status = "failed"
+                    task.error = _json_error("agent_attempt_metadata_write_failed", "无法保存 executor attempt 恢复信息")
+                    logger.error("attempt 恢复信息保存失败：attempt={} error={}", task.executor_attempt_id, type(exc).__name__)
                 task.done.set()
         # 运行任务由执行线程终止并完成数据库维护，再统一发布最终状态。
         return task
@@ -1809,10 +1831,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, _json_error("executor_unauthorized", "executor 认证失败"))
             return
         path = urlsplit(self.path).path.rstrip("/") or "/"
-        cancel_match = re.fullmatch(r"/v1/tasks/([^/]+)/cancel", path)
+        cancel_match = re.fullmatch(r"/v1/tasks/([^/]+)/(cancel|interrupt-for-shutdown)", path)
         if cancel_match:
             try:
-                task = self.server.executor.cancel(unquote(cancel_match.group(1)))
+                reason = "service_shutdown" if cancel_match.group(2) == "interrupt-for-shutdown" else "task_interrupted"
+                task = self.server.executor.cancel(unquote(cancel_match.group(1)), reason=reason)
             except KeyError:
                 self._send(404, _json_error("task_not_found", "任务不存在"))
                 return

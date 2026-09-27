@@ -1462,7 +1462,7 @@ class TaskRepository:
         self.session.flush()
         return True
 
-    def fail_fenced(self, task_id: str, claim_generation: int, owner: str, *, error: dict[str, Any], message: str, retry: bool = True, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None) -> tuple[bool, bool]:
+    def fail_fenced(self, task_id: str, claim_generation: int, owner: str, *, error: dict[str, Any], message: str, retry: bool = True, result: Any | None = None, retry_delay_seconds: int = 0, resume_available: bool | None = None, resume_reason: str | None = None, session_id: str | None = None, executor_attempt_id: str | None = None, resume_max_attempts: int = 0) -> tuple[bool, bool]:
         """在 fencing 条件下失败或重新排队任务，并追加有限错误历史。"""
         now = utcnow()
         task = self.session.scalar(select(Task).where(Task.scope_id == self.scope.scope_id, Task.id == task_id).with_for_update())
@@ -1491,7 +1491,13 @@ class TaskRepository:
             task.resume_reason = resume_reason
             if task.resume_available and task.resume_started_at is None:
                 task.resume_started_at = now
-        should_retry = bool(retry and task.attempt_count < task.max_attempts)
+        # 已验证 session 使用独立预算，图片阶段的 max_attempts 保持原值。
+        resumable_agent = bool(
+            task.task_type == "meme_context_generation"
+            and task.resume_available
+            and task.resume_attempt_count < resume_max_attempts
+        )
+        should_retry = bool(retry and (resumable_agent or task.attempt_count < task.max_attempts))
         if should_retry:
             task.status = "queued"
             task.available_at = now + timedelta(seconds=max(0, min(int(retry_delay_seconds), 3600)))

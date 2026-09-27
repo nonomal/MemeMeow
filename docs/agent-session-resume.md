@@ -17,6 +17,16 @@ session 才能续跑。429、5xx、连接中断和可证明的进程级暂态错
 用户显式创建新的处理 revision。续跑使用新的 executor attempt ID，不得复用已终态
 ID，也不得使用 OpenCode 全局“继续最近会话”语义。
 
+正常关闭服务时，Worker 停止认领新任务，运行中的 Agent 收到 `service_shutdown`
+中断通知。原执行线程继续维护租约，等待进程结束和 attempt 恢复信息保存，再将
+符合上述条件的同一 Task 排入 `queued`。服务启动后按照现有等待时间继续原 session。
+父 Job、Task ID、输入和授权关联保持不变；适配层继续使用原额度预留和原期限。
+停机续跑计入已有次数和累计时间预算。用户取消和已提交的成功结果保持原状态。
+session 缺失、进程结束无法确认或恢复信息保存失败时，任务按具体原因结束。
+
+Compose 为 API 提供 120 秒关闭时间，并按照依赖关系在 API 退出后关闭 executor
+与 PostgreSQL。突然终止或超过关闭时间后被强制终止，继续使用原有租约过期规则。
+
 任务接口中的 `resume_available`、`resume_reason`、`session_id`、
 `executor_attempt_id`、`resume_attempts`、`resume_started_at`、`first_error` 和 `error_history` 只包含有限脱敏诊断。图片
 处理 Job 的阶段摘要会同步展示当前 attempt 的 session/恢复状态；不会返回 prompt、

@@ -89,6 +89,8 @@ STABLE_TASK_ERRORS = {
     "agent_result_path_invalid",
     "target_changed",
     "task_interrupted",
+    "service_shutdown",
+    "agent_attempt_metadata_write_failed",
     "generation_policy_conflict",
     "processing_options_conflict",
     "invalid_auto_name",

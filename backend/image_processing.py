@@ -2031,6 +2031,8 @@ class ImageProcessingWorker:
         """认领 job，按阶段顺序创建或执行一个叶子 Task。"""
         reschedule = False
         try:
+            if self._stopped.is_set():
+                return
             current_job = self.jobs.get(job_id)
             now = utcnow()
             if current_job is not None and current_job.status == "running" and current_job.lease_owner == self.owner and current_job.lease_expires_at is not None and current_job.lease_expires_at > now:
@@ -2510,15 +2512,21 @@ class ImageProcessingWorker:
             except Exception as exc:  # noqa: BLE001 - 恢复扫描不能终止应用
                 logger.info("image_processing_reconcile_failed scope=%s error=%s", self.scope.scope_id, type(exc).__name__)
 
-    def shutdown(self) -> None:
-        """停止新 job 认领并等待图片叶子任务退出，再释放线程池。"""
+    def stop_claiming(self) -> None:
+        """停止安排 Job 和叶子 Task，保持正在运行任务的心跳。"""
         self._stopped.set()
-        if self._reconcile_thread is not None:
-            self._reconcile_thread.join(timeout=2)
         if self._task_runner is not None:
-            self._task_runner.shutdown()
+            self._task_runner.stop_claiming()
+        if self._reconcile_thread is not None:
+            self._reconcile_thread.join()
+
+    def shutdown(self) -> None:
+        """等待图片任务保存状态，再处理剩余租约并释放资源。"""
+        self.stop_claiming()
         # 线程仍可能持有 PostgreSQL session；数据库连接池必须在它们退出后再销毁。
         self.executor.shutdown(wait=True, cancel_futures=True)
+        if self._task_runner is not None:
+            self._task_runner.shutdown()
 
 
 class SingleImageEmbeddingService:

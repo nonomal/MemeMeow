@@ -6,6 +6,8 @@ sidecar 的读取、指纹复核和写入始终由上层元数据服务完成。
 
 from __future__ import annotations
 
+from loguru import logger
+
 import hashlib
 import io
 import json
@@ -625,6 +627,8 @@ class OpenCodeRunner:
             "model_broker_endpoint_invalid",
             "agent_timeout",
             "task_interrupted",
+            "service_shutdown",
+            "agent_attempt_metadata_write_failed",
             "agent_process_failed",
             "unknown_execution",
             "agent_output_invalid_json",
@@ -1801,6 +1805,7 @@ class OpenCodeRunner:
                         workspace_capability=capability,
                         model_capability=model_capability,
                         analysis_policy=analysis_policy,
+                        shutdown_requested=self._closing.is_set,
                     )
                     if response.executor_attempt_id:
                         self._remember_executor_attempt(task_id, response.executor_attempt_id)
@@ -1913,9 +1918,9 @@ class OpenCodeRunner:
                 timed_out = False
                 interrupted = False
                 try:
-                    if self._take_pre_cancelled(task_id):
+                    interrupted = self._take_pre_cancelled(task_id)
+                    if interrupted or self._closing.is_set():
                         self._terminate(process)
-                        interrupted = True
                     else:
                         # stdout/stderr 已重定向到临时文件；communicate 只等待进程。
                         process.communicate(timeout=self.settings.opencode_timeout_seconds)
@@ -1953,7 +1958,9 @@ class OpenCodeRunner:
                 if not session_id:
                     session_id = resume_session_id
                 if interrupted:
-                    raise OpenCodeError("task_interrupted", "Agent 任务已取消", session_id=session_id, executor_attempt_id=local_executor_attempt_id)
+                    raise OpenCodeError("task_interrupted", "Agent 任务已取消", session_id=session_id, executor_attempt_id=local_executor_attempt_id, process_reaped=process.poll() is not None)
+                if self._closing.is_set() and process.returncode != 0:
+                    raise OpenCodeError("service_shutdown", "服务正常关闭，Agent 执行已中断", session_id=session_id, executor_attempt_id=local_executor_attempt_id, process_reaped=process.poll() is not None)
                 if timed_out:
                     raise OpenCodeError("agent_timeout", "OpenCode 执行超时", session_id=session_id, executor_attempt_id=local_executor_attempt_id)
                 if process.returncode != 0:
@@ -2017,13 +2024,12 @@ class OpenCodeRunner:
         """终止当前受管理进程，供应用生命周期收束调用。"""
         self._closing.set()
         with self._process_lock:
-            self._cancelled_task_ids.update(self._active_task_ids)
             executor_business_ids = list(self._active_executor_task_ids)
         for task_id in executor_business_ids:
             try:
-                self.executor.cancel(self.executor.attempt_id_for(task_id) or task_id)
-            except AgentExecutorError:
-                pass
+                self.executor.cancel(self.executor.attempt_id_for(task_id) or task_id, reason="service_shutdown")
+            except AgentExecutorError as exc:
+                logger.warning("停机中断请求失败：task={} error={}", task_id, exc.code)
         with self._process_lock:
             processes = list(self._processes)
             if self._process is not None and self._process not in processes:

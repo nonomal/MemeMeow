@@ -336,6 +336,8 @@ class PostgresTaskWorkerManager:
         service = None
         claim = None
         try:
+            if self._stopped.is_set():
+                return
             claim = self._claim_for_task(task_id)
             if claim is None:
                 self._task_finished(task_id, claimed=False)
@@ -491,11 +493,17 @@ class PostgresTaskWorkerManager:
         for task_id in task_ids:
             self.schedule(task_id)
 
-    def shutdown(self) -> None:
-        """停止调度并等待本进程持有的任务退出后再释放线程池。"""
+    def stop_claiming(self) -> None:
+        """停止任务认领和恢复扫描，保留运行任务的写回能力。"""
         self._stopped.set()
         if self._recovery_thread is not None:
             self._recovery_thread.join()
+
+    def shutdown(self) -> None:
+        """等待自有线程退出；共享线程池由生命周期管理器提前等待。"""
+        self.stop_claiming()
+        if self._owns_executor:
+            self._executor.shutdown(wait=True, cancel_futures=True)
         now = utcnow()
         with self.resources.factory() as session:
             rows = list(session.scalars(select(Task).where(Task.status == "running", Task.lease_owner == self.owner).with_for_update(skip_locked=True)))
@@ -521,7 +529,3 @@ class PostgresTaskWorkerManager:
                 task.updated_at = now
                 self._release_slot(session, task.scope_id, task.id, owner=self.owner, claim_generation=task.claim_generation)
             session.commit()
-        if self._owns_executor:
-            # 任务线程可能仍在使用数据库连接；先等待其退出，避免应用释放连接池
-            # 后留下后台事务与下一次启动/测试清理互相死锁。
-            self._executor.shutdown(wait=True, cancel_futures=True)

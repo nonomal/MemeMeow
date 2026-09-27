@@ -650,17 +650,22 @@ async def shutdown_lifecycle(
         except BaseException as exc:  # noqa: BLE001 - 扩展失败不能跳过核心资源关闭
             errors.append(("shutdown.extension", exc))
     opencode = getattr(app.state, "opencode", None)
+    image_workers = list(getattr(app.state, "image_processing_workers", {}).values())
+    for image_worker in image_workers:
+        _close_resource(image_worker, "stop_claiming", errors, "shutdown.image_worker.stop_claiming")
+    if runtime is not None:
+        _close_resource(runtime.worker_manager, "stop_claiming", errors, "shutdown.worker_manager.stop_claiming")
     _close_resource(opencode, "shutdown", errors, "shutdown.opencode")
-    for image_worker in reversed(list(getattr(app.state, "image_processing_workers", {}).values())):
+    for image_worker in reversed(image_workers):
         _close_resource(image_worker, "shutdown", errors, "shutdown.image_worker")
     if runtime is not None:
-        _close_resource(runtime.factory, "shutdown", errors, "shutdown.factory")
-        _close_resource(runtime.worker_manager, "shutdown", errors, "shutdown.worker_manager")
         if runtime.shared_worker_executor is not None:
             try:
                 runtime.shared_worker_executor.shutdown(wait=True, cancel_futures=True)
             except BaseException as exc:  # noqa: BLE001 - 线程池失败不能阻止 Engine 收束
                 errors.append(("shutdown.executor", exc))
+        _close_resource(runtime.worker_manager, "shutdown", errors, "shutdown.worker_manager")
+        _close_resource(runtime.factory, "shutdown", errors, "shutdown.factory")
     _close_resource(setup.engine, "dispose", errors, "shutdown.engine")
     _clear_lifecycle_state(app, managed_factory=not setup.custom_factory)
     if primary_error is not None:
