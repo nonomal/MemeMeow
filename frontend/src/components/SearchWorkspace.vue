@@ -258,7 +258,6 @@ async function runSearch(): Promise<void> {
 
   <SearchResultDetailsDialog
     v-if="detailItem"
-    :meme-id="detailItem.meme_id"
     :media-url="detailItem.media_url"
     :score="detailItem.score"
     :return-focus="detailTrigger"

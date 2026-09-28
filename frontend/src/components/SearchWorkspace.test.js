@@ -121,6 +121,8 @@ describe('SearchWorkspace', () => {
     expect(copyImage).not.toHaveBeenCalled()
     expect(wrapper.find('.search-result-dialog').exists()).toBe(true)
     expect(wrapper.find('.search-result-dialog').text()).toContain('0.8235')
+    expect(wrapper.find('.search-result-dialog').text()).not.toContain('Meme ID')
+    expect(wrapper.find('.search-result-dialog').text()).not.toContain('meme-1')
     await wrapper.find('.search-result-dialog .primary').trigger('click')
     await flushPromises()
     expect(wrapper.find('.search-result-dialog').exists()).toBe(false)

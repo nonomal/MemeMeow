@@ -4,7 +4,6 @@ import { shallowRef } from 'vue'
 import { useModalDialog } from '../composables/useModalDialog'
 
 const props = defineProps<{
-  memeId: string
   mediaUrl: string
   score?: number
   returnFocus?: HTMLElement | null
@@ -33,7 +32,6 @@ useModalDialog({ dialog, initialFocus: closeButton, returnFocus: props.returnFoc
         <img :src="mediaUrl" alt="检索结果图片" />
         <dl>
           <div><dt>Embedding 匹配度</dt><dd>{{ scoreLabel }}</dd></div>
-          <div><dt>Meme ID</dt><dd>{{ memeId }}</dd></div>
         </dl>
       </div>
       <footer class="search-result-dialog-actions">
