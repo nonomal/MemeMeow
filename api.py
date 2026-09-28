@@ -15,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import RLock
 from typing import Any, Callable
 from uuid import UUID, uuid4
 from urllib.parse import quote
@@ -160,6 +159,7 @@ from backend.application_lifecycle import (
     build_scope_runtime,
     callback_verification_keys,
     prepare_lifecycle,
+    scope_processing_worker,
     shutdown_lifecycle,
     start_extensions,
 )
@@ -1503,32 +1503,7 @@ def _processing_worker(request: Request) -> ImageProcessingWorker | None:
 
 def _scope_processing_worker(application: FastAPI, scope: ScopeContext) -> ImageProcessingWorker | None:
     """为可信 scope 获取图片 Worker，供 HTTP 与持久任务共同调用。"""
-    workers = getattr(application.state, "image_processing_workers", None)
-    if not isinstance(workers, dict):
-        return None
-    lock = getattr(application.state, "image_processing_workers_lock", None)
-    if lock is None:
-        lock = application.state.image_processing_workers_lock = RLock()
-    with lock:
-        worker = workers.get(scope.scope_id)
-        if worker is not None:
-            return worker
-        factory = getattr(application.state, "service_factory", None)
-        if not callable(getattr(factory, "for_scope", None)):
-            return None
-        services = validate_scope_services(scope, factory.for_scope(scope))
-        worker = ImageProcessingWorker(
-            application.state.database,
-            scope_id=scope,
-            task_service=services.tasks,
-            policy=getattr(application.state, "operation_policy_gateway", None),
-            grant_store=getattr(application.state, "operation_grants", None),
-            max_workers=validate_agent_concurrency(getattr(application.state.settings, "opencode_concurrency", 1)),
-            task_handlers=getattr(application.state, "image_processing_task_handlers", None),
-        )
-        workers[scope.scope_id] = worker
-        worker.start()
-        return worker
+    return scope_processing_worker(application, scope)
 
 
 def _processing_config(request: Request) -> dict[str, object]:

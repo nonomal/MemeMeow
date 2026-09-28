@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import inspect
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from fastapi import FastAPI
+from loguru import logger
+from sqlalchemy import select
 
 from backend.app_extensions import ApplicationExtension
 from backend.callbacks import (
@@ -23,9 +25,11 @@ from backend.callbacks import (
     DEFAULT_CALLBACK_REGISTRY,
     HMACCallbackCredentials,
 )
-from backend.config import Settings
+from backend.config import Settings, validate_agent_concurrency
 from backend.config_http import STORAGE_PREFLIGHT_BLOCKING_KEYS
 from backend.database import DatabaseError, DatabaseResources, ScopeContext, check_database, create_engine_for_settings
+from backend.image_processing import ACTIVE_JOB_STATUSES, ImageProcessingWorker
+from backend.persistence.models import ImageProcessingJob
 from backend.opencode import OpenCodeRunner
 from backend.opencode_activity import OpenCodeActivityReader
 from backend.opencode_workspace import LocalWorkspaceProvider, MissingWorkspaceProvider
@@ -39,7 +43,7 @@ from backend.operation_policy import (
 from backend.pg_services import PostgresMetadataService, PostgresSearchService, PostgresTaskService, PostgresTaskWorkerManager
 from backend.paths import PathResolver
 from backend.reverse_image import ReverseImageProviderBinding, ReverseImageService
-from backend.scope import LocalScopeResolver, ScopeServiceFactory, ScopeServices
+from backend.scope import LocalScopeResolver, ScopeServiceFactory, ScopeServices, validate_scope_services
 from backend.visual import VisualInferenceClient, VisualSearchService
 
 
@@ -92,7 +96,6 @@ class _ScopeBuildOwnership:
     worker_manager: Any | None = None
     local_services: ScopeServices | None = None
     runtime_factory: Any | None = None
-    image_workers: list[Any] = field(default_factory=list)
     factory_started: bool = False
 
 
@@ -357,7 +360,12 @@ def _prepare_lifecycle(
 def _cleanup_scope_build(ownership: _ScopeBuildOwnership, setup: LifecycleSetup) -> list[tuple[str, BaseException]]:
     """收束 scope runtime 构造失败时已经创建的 Worker、factory 和线程池。"""
     errors: list[tuple[str, BaseException]] = []
-    for image_worker in reversed(ownership.image_workers):
+    image_workers = list(getattr(setup.app.state, "image_processing_workers", {}).values())
+    for image_worker in image_workers:
+        _close_resource(image_worker, "stop_claiming", errors, "build.image_worker.stop_claiming")
+    _close_resource(ownership.worker_manager, "stop_claiming", errors, "build.worker_manager.stop_claiming")
+    _close_resource(setup.opencode, "shutdown", errors, "build.opencode")
+    for image_worker in reversed(image_workers):
         _close_resource(image_worker, "shutdown", errors, "build.image_worker")
     if ownership.runtime_factory is not None and (not setup.custom_factory or ownership.factory_started):
         _close_resource(ownership.runtime_factory, "shutdown", errors, "build.factory")
@@ -367,6 +375,51 @@ def _cleanup_scope_build(ownership: _ScopeBuildOwnership, setup: LifecycleSetup)
     # 在这里提前删除，否则 shutdown_lifecycle 无法再找到并关闭它们。
     _clear_scope_runtime_state(setup.app, managed_factory=setup.configured_factory is None)
     return errors
+
+
+def scope_processing_worker(application: FastAPI, scope: ScopeContext) -> ImageProcessingWorker | None:
+    """为可信 scope 创建并启动唯一图片 Worker，供请求和启动恢复共同调用。"""
+    workers = getattr(application.state, "image_processing_workers", None)
+    if not isinstance(workers, dict):
+        return None
+    with application.state.image_processing_workers_lock:
+        worker = workers.get(scope.scope_id)
+        if worker is not None:
+            return worker
+        factory = getattr(application.state, "service_factory", None)
+        if not callable(getattr(factory, "for_scope", None)):
+            return None
+        services = validate_scope_services(scope, factory.for_scope(scope))
+        worker = ImageProcessingWorker(
+            application.state.database,
+            scope_id=scope,
+            task_service=services.tasks,
+            policy=getattr(application.state, "operation_policy_gateway", None),
+            grant_store=getattr(application.state, "operation_grants", None),
+            max_workers=validate_agent_concurrency(application.state.settings.opencode_concurrency),
+            task_handlers=application.state.image_processing_task_handlers,
+        )
+        # 先登记资源，启动失败时生命周期仍能关闭已经创建的线程和执行器。
+        workers[scope.scope_id] = worker
+        worker.start()
+        return worker
+
+
+def restore_image_processing_workers(application: FastAPI) -> int:
+    """启动有未完成图片 Job 的 scope Worker，返回扫描到的 scope 数量。"""
+    with application.state.database.factory() as session:
+        scope_ids = list(session.scalars(
+            select(ImageProcessingJob.scope_id)
+            .where(ImageProcessingJob.status.in_(ACTIVE_JOB_STATUSES))
+            .distinct()
+            .order_by(ImageProcessingJob.scope_id)
+        ))
+    # 创建服务和开始执行前归还连接，Worker 的扫描及认领使用自己的短事务。
+    for scope_id in scope_ids:
+        if scope_processing_worker(application, ScopeContext(scope_id)) is None:
+            raise DatabaseError("image_processing_worker_unavailable")
+    logger.info("image_processing_startup_recovery scopes={}", len(scope_ids))
+    return len(scope_ids)
 
 
 def build_scope_runtime(
@@ -417,7 +470,7 @@ def _build_scope_runtime(
     visual_search_factory: Callable[..., Any] | None = None,
     ownership: _ScopeBuildOwnership,
 ) -> ScopeRuntime:
-    """创建 scope service factory、进程级 Worker 和 local 图片 Worker。
+    """创建 scope service factory、进程级 Worker 并恢复未完成图片 Job。
 
     ``register_handlers`` 和 ``start_services`` 是任务 handler 的显式接线点，避免
     canonical 生命周期模块反向依赖 HTTP 入口私有函数。
@@ -591,27 +644,14 @@ def _build_scope_runtime(
     app.state.image_processing_task_handlers = dict(task_handlers)
     app.state.image_processing_workers = {}
     app.state.image_processing_workers_lock = RLock()
-    if local_services is not None:
-        from backend.image_processing import ImageProcessingWorker
-        from backend.config import validate_agent_concurrency
-
-        app.state.image_processing_workers[local_services.scope.scope_id] = ImageProcessingWorker(
-            app.state.database,
-            scope_id=local_services.scope,
-            task_service=local_services.tasks,
-            policy=app.state.operation_policy_gateway,
-            grant_store=app.state.operation_grants,
-            max_workers=validate_agent_concurrency(getattr(settings, "opencode_concurrency", 1)),
-            task_handlers=dict(task_handlers),
-        )
-        ownership.image_workers.append(app.state.image_processing_workers[local_services.scope.scope_id])
-        if callable(getattr(app.state.database, "factory", None)):
-            app.state.image_processing_workers[local_services.scope.scope_id].start()
     tasks = local_services.tasks if local_services is not None else None
     if tasks is not None:
         app.state.tasks = tasks
     ownership.factory_started = True
     app.state.task_scope_diagnostics = runtime_factory.start_all()
+    if local_services is not None:
+        scope_processing_worker(app, local_services.scope)
+    restore_image_processing_workers(app)
     setup.factory = runtime_factory
     setup.worker_manager = worker_manager
     setup.shared_worker_executor = shared_worker_executor
