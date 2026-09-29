@@ -1,11 +1,17 @@
 .git
 .venv
 __pycache__
+.pytest_cache
 *.py[cod]
 frontend/node_modules
 frontend/dist
 legacy
 data
 temp
+tmp
+.local-real-test
+test-results
 .env
+.env.*
+!.env.example
 openspec/changes

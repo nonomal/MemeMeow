@@ -12,10 +12,15 @@ MemeMeow 是一个基于自然语言的表情包检索工具。它能让你通�
 - **👁️ 视觉近邻搜索**: 支持本地 DINOv2 视觉模型，实现图片之间的相似度搜索。
 - **📦 容器部署**: 提供 Vue 3 Web 界面和统一的 API，服务可通过 Docker Compose 启动。
 - **⚡ 任务调度**: 内置受控并发队列，支持长任务异步处理（如批量图片导入、后台模型推理），支持单机部署。
+  ![截图](docs/images/image-preview-zh.png)
 
 ## 🚀 立即使用
 
-预计将于九月底开放。
+前往[MemeMeow官网](https://mememeow.cc) 立即开始使用，无需本地部署。
+
+可在[Release](https://github.com/MemeMeow-Studio/MemeMeow/releases/tag/v0.1.0) 下载桌面端软件。移动端软件正在开发。
+
+> 目前正处于早期测试阶段。可以提交issue或加入交流群反馈错误。
 
 ## 📖 核心功能与使用说明
 
@@ -128,7 +133,11 @@ MemeMeow 本质是一个 API 驱动的服务。如果你是开发者，可以直
 
 关于双环境隔离设计与作用域约束，请查阅 [应用作用域设计 (docs/application-scope.md)](docs/application-scope.md)。 -->
 
-官方MemeMeow API正在开发。同时，我们欢迎相关使用需求的讨论。您可以提出issue或加入Q群交流。<a id="-related-applications"></a>
+官方MemeMeow API正在开发。同时，我们欢迎相关使用需求的讨论。您可以提出issue或加入Q群交流。
+
+## 加入交流
+
+QQ群 https://qm.qq.com/q/UiY4Ix5xqa
 
 ## 📦 社区相关应用
 
@@ -147,8 +156,6 @@ MemeMeow 本质是一个 API 驱动的服务。如果你是开发者，可以直
 
 ## 📄 License & ⭐ Star History
 
-本项目采用 [MIT](LICENSE) 开源协议。
+本项目采用 [GNU Affero General Public License v3.0 或更高版本](LICENSE) 开源协议。
 
 [![Star History Chart](https://api.star-history.com/svg?repos=MemeMeow-Studio/MemeMeow&type=Date)](https://star-history.com/#MemeMeow-Studio/MemeMeow&Date)
-
-*(注：迁移前的 Streamlit 旧版本已归档至 `legacy/streamlit-v1/`，不再参与当前版本的构建与测试)*

@@ -21,6 +21,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend ./backend
+# backend.database 的 Repository 导入会复用 executor.agent_limits 的公共校验。
+COPY executor ./executor
 COPY visual_service.py ./visual_service.py
 
 ENV PYTHONUNBUFFERED=1 \
